@@ -1,0 +1,28 @@
+name: Test Self-Hosted Runner
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-runner:
+    runs-on: [self-hosted, macOS, ARM64]
+
+    steps:
+      - name: Runner information
+        run: |
+          echo "Self-hosted runner is working!"
+          echo "Hostname: $(hostname)"
+          echo "Architecture: $(uname -m)"
+          echo "OS: $(uname -s)"
+
+      - name: Check installed tools
+        run: |
+          git --version
+          docker --version
+          kubectl version --client
+          terraform version
+
+      - name: Check Kubernetes cluster
+        run: |
+          kubectl config current-context
+          kubectl get nodes
