@@ -79,6 +79,35 @@ jobs:
             --as=system:serviceaccount:spark:spark \
             --namespace=spark
 
+          kubectl auth can-i create services \
+            --as=system:serviceaccount:spark:spark \
+            --namespace=spark
+          
+          kubectl auth can-i create configmaps \
+            --as=system:serviceaccount:spark:spark \
+            --namespace=spark
+
+      - name: Prepare Kubernetes credentials for Spark
+        run: |
+          mkdir -p /tmp/spark-k8s
+
+          kubectl config view \
+            --raw \
+            --minify \
+            --flatten \
+            > /tmp/spark-k8s/config
+
+          kubectl config view \
+            --raw \
+            --minify \
+            --flatten \
+            -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' \
+            | base64 --decode \
+            > /tmp/spark-k8s/ca.crt
+
+           echo "Kubernetes CA certificate created:"
+           ls -l /tmp/spark-k8s/ca.crt
+            
       # -------------------------------------------------------
       # Submit Spark application
       # -------------------------------------------------------
@@ -94,6 +123,7 @@ jobs:
             --deploy-mode cluster \
             --name data-platform-lab \
             --conf spark.kubernetes.namespace=spark \
+            --conf spark.kubernetes.authenticate.submission.caCertFile=/spark-k8s/ca.crt \
             --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \
             --conf spark.kubernetes.container.image=data-platform-spark:latest \
             --conf spark.kubernetes.container.image.pullPolicy=Never \
