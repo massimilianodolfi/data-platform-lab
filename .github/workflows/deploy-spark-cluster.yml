@@ -1,0 +1,134 @@
+name: Deploy Spark
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: spark-data-platform-lab
+  cancel-in-progress: false
+
+jobs:
+  deploy-spark:
+    name: Deploy Spark on Kubernetes
+
+    runs-on: [self-hosted, macOS, ARM64]
+
+    steps:
+
+      # -------------------------------------------------------
+      # Checkout
+      # -------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------------
+      # Verify environment
+      # -------------------------------------------------------
+
+      - name: Verify Kubernetes cluster
+        run: |
+          echo "Kubernetes context:"
+          kubectl config current-context
+
+          echo
+          echo "Nodes:"
+          kubectl get nodes
+
+          echo
+          echo "Spark namespace:"
+          kubectl get namespace spark
+
+      # -------------------------------------------------------
+      # Spark image
+      # -------------------------------------------------------
+
+      - name: Build Spark image
+        run: |
+          docker build \
+            --platform linux/arm64 \
+            -t data-platform-spark:latest \
+            ./spark
+
+      # -------------------------------------------------------
+      # Load image into kind
+      # -------------------------------------------------------
+
+      - name: Load Spark image into kind
+        run: |
+          kind load docker-image \
+            data-platform-spark:latest \
+            --name data-platform-lab
+
+      # -------------------------------------------------------
+      # RBAC
+      # -------------------------------------------------------
+
+      - name: Configure Spark RBAC
+        run: |
+          kubectl apply \
+            -f kubernetes/spark/spark-rbac.yaml
+
+      # -------------------------------------------------------
+      # Verify permissions
+      # -------------------------------------------------------
+
+      - name: Verify Spark permissions
+        run: |
+          kubectl auth can-i create pods \
+            --as=system:serviceaccount:spark:spark \
+            --namespace=spark
+
+      # -------------------------------------------------------
+      # Submit Spark application
+      # -------------------------------------------------------
+
+      - name: Submit Spark application
+        run: |
+          docker run --rm \
+            --network kind \
+            -v "$HOME/.kube:/root/.kube:ro" \
+            data-platform-spark:latest \
+            /opt/spark/bin/spark-submit \
+            --master k8s://https://data-platform-lab-control-plane:6443 \
+            --deploy-mode cluster \
+            --name data-platform-lab \
+            --conf spark.kubernetes.namespace=spark \
+            --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \
+            --conf spark.kubernetes.container.image=data-platform-spark:latest \
+            --conf spark.kubernetes.container.image.pullPolicy=Never \
+            --conf spark.executor.instances=2 \
+            --conf spark.driver.memory=1g \
+            --conf spark.executor.memory=2g \
+            --conf spark.executor.cores=1 \
+            local:///opt/spark/jobs/hello_spark.py
+
+      # -------------------------------------------------------
+      # Inspect deployment
+      # -------------------------------------------------------
+
+      - name: Show Spark pods
+        if: always()
+        run: |
+          echo "Spark pods:"
+          kubectl get pods -n spark -o wide
+
+      # -------------------------------------------------------
+      # Driver logs
+      # -------------------------------------------------------
+
+      - name: Show Spark driver logs
+        if: always()
+        run: |
+          DRIVER=$(kubectl get pods \
+            -n spark \
+            -l spark-role=driver \
+            --sort-by=.metadata.creationTimestamp \
+            -o name | tail -1)
+
+          if [ -n "$DRIVER" ]; then
+            echo "Spark driver: $DRIVER"
+            kubectl logs -n spark "$DRIVER"
+          else
+            echo "No Spark driver found."
+          fi
