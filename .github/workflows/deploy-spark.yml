@@ -1,0 +1,153 @@
+name: Deploy Spark Platform
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+# Only one Terraform deployment may manipulate this state at a time
+concurrency:
+  group: terraform-data-platform-lab
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy with Terraform
+    runs-on: [self-hosted, macOS, ARM64]
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      # ---------------------------------------------------------
+      # 1. Checkout
+      # ---------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------
+      # 2. Restore latest Terraform state
+      # ---------------------------------------------------------
+
+      - name: Restore latest Terraform state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          echo "Looking for latest Terraform state artifact..."
+
+          ARTIFACT_ID=$(gh api \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '
+              [.artifacts[]
+               | select(.expired == false)
+               | select(.name | startswith("terraform-state-"))]
+              | sort_by(.created_at)
+              | reverse
+              | .[0].id // empty
+            ')
+
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "No previous Terraform state found."
+            echo "Terraform will start with a new state."
+            exit 0
+          fi
+
+          echo "Restoring artifact ID: $ARTIFACT_ID"
+
+          gh api \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > /tmp/terraform-state.zip
+
+          unzip -o /tmp/terraform-state.zip -d .
+
+          rm /tmp/terraform-state.zip
+
+          if [ -f terraform.tfstate ]; then
+            echo "Terraform state restored successfully."
+          else
+            echo "ERROR: Artifact did not contain terraform.tfstate."
+            exit 1
+          fi
+
+      # ---------------------------------------------------------
+      # 3. Verify M4 / Kubernetes environment
+      # ---------------------------------------------------------
+
+      - name: Check environment
+        run: |
+          echo "Architecture:"
+          uname -m
+
+          echo "Terraform:"
+          terraform version
+
+          echo "Kubernetes context:"
+          kubectl config current-context
+
+          echo "Kubernetes nodes:"
+          kubectl get nodes
+
+      # ---------------------------------------------------------
+      # 4. Terraform validation
+      # ---------------------------------------------------------
+
+      - name: Terraform Format
+        run: terraform fmt -check
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      # ---------------------------------------------------------
+      # 5. Plan and deploy
+      # ---------------------------------------------------------
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+      # ---------------------------------------------------------
+      # 6. Verify resulting state
+      # ---------------------------------------------------------
+
+      - name: Show Terraform resources
+        run: terraform state list
+
+      - name: Check Kubernetes resources
+        run: |
+          kubectl get namespaces
+          kubectl get pods -A
+
+      # ---------------------------------------------------------
+      # 7. Generate timestamp for artifact
+      # ---------------------------------------------------------
+
+      - name: Generate timestamp
+        id: timestamp
+        if: always()
+        working-directory: .
+        run: |
+          echo "value=$(date -u +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------
+      # 8. Persist Terraform state
+      # ---------------------------------------------------------
+
+      - name: Upload Terraform state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-state-${{ steps.timestamp.outputs.value }}
+          path: terraform/terraform.tfstate
+          retention-days: 90
+          if-no-files-found: ignore
