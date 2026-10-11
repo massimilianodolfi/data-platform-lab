@@ -112,27 +112,48 @@ jobs:
       # Submit Spark application
       # -------------------------------------------------------
 
+#      - name: Submit Spark application
+#        run: |
+#          docker run --rm \
+#            --network kind \
+#            -v "$HOME/.kube:/root/.kube:ro" \
+#            data-platform-spark:latest \
+#            /opt/spark/bin/spark-submit \
+#            --master k8s://https://data-platform-lab-control-plane:6443 \
+#            --deploy-mode cluster \
+#            --name data-platform-lab \
+#            --conf spark.kubernetes.namespace=spark \
+#            --conf spark.kubernetes.authenticate.submission.caCertFile=/spark-k8s/ca.crt \
+#            --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \
+#            --conf spark.kubernetes.container.image=data-platform-spark:latest \
+#            --conf spark.kubernetes.container.image.pullPolicy=Never \
+#            --conf spark.executor.instances=2 \
+#            --conf spark.driver.memory=1g \
+#            --conf spark.executor.memory=2g \
+#            --conf spark.executor.cores=1 \
+#            local:///opt/spark/jobs/hello_spark.py
+
       - name: Submit Spark application
         run: |
           docker run --rm \
-            --network kind \
-            -v "$HOME/.kube:/root/.kube:ro" \
-            data-platform-spark:latest \
-            /opt/spark/bin/spark-submit \
-            --master k8s://https://data-platform-lab-control-plane:6443 \
-            --deploy-mode cluster \
-            --name data-platform-lab \
-            --conf spark.kubernetes.namespace=spark \
-            --conf spark.kubernetes.authenticate.submission.caCertFile=/spark-k8s/ca.crt \
-            --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \
-            --conf spark.kubernetes.container.image=data-platform-spark:latest \
-            --conf spark.kubernetes.container.image.pullPolicy=Never \
-            --conf spark.executor.instances=2 \
-            --conf spark.driver.memory=1g \
-            --conf spark.executor.memory=2g \
-            --conf spark.executor.cores=1 \
-            local:///opt/spark/jobs/hello_spark.py
-
+          --network kind \
+          -v /tmp/spark-k8s:/spark-k8s:ro \
+          -e KUBECONFIG=/spark-k8s/config \
+          data-platform-spark:latest \
+          /opt/spark/bin/spark-submit \
+          --master k8s://https://data-platform-lab-control-plane:6443 \
+          --deploy-mode cluster \
+          --name data-platform-lab \
+          --conf spark.kubernetes.namespace=spark \
+          --conf spark.kubernetes.authenticate.submission.caCertFile=/spark-k8s/ca.crt \
+          --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \
+          --conf spark.kubernetes.container.image=data-platform-spark:latest \
+          --conf spark.kubernetes.container.image.pullPolicy=Never \
+          --conf spark.executor.instances=2 \
+          --conf spark.driver.memory=1g \
+          --conf spark.executor.memory=2g \
+          --conf spark.executor.cores=1 \
+          local:///opt/spark/jobs/hello_spark.py     
       # -------------------------------------------------------
       # Inspect deployment
       # -------------------------------------------------------
