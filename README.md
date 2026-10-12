@@ -1,6 +1,6 @@
 # Data Platform Lab
 
-A local data-platform engineering lab running on an Apple Silicon Mac. It combines GitHub Actions, a self-hosted runner, Terraform, Docker, kind Kubernetes, Apache Spark, PySpark, and JupyterLab.
+A local data-platform engineering lab for Apple Silicon, combining GitHub Actions, a self-hosted runner, Terraform, Docker, kind Kubernetes, Apache Spark, PySpark, and JupyterLab.
 
 ## Architecture
 
@@ -29,8 +29,6 @@ kind Kubernetes cluster       Spark container image
               +-------+-------+
               |               |
          Spark driver     Spark executors
-                              |
-                    Kubernetes workers
 
 JupyterLab container
        |
@@ -83,8 +81,6 @@ data-platform-lab/
 
 ## Prerequisites
 
-Install the required tools:
-
 ```bash
 brew tap hashicorp/tap
 brew install hashicorp/tap/terraform
@@ -93,19 +89,9 @@ brew install git gh kubectl kind helm jq python
 
 Docker Desktop must be installed and running.
 
-Verify the tools:
-
-```bash
-docker version
-terraform version
-kubectl version --client
-kind version
-gh --version
-```
-
 ## Create the Kubernetes cluster
 
-The `kubernetes/kind-config.yaml` file defines a three-node cluster:
+`kubernetes/kind-config.yaml`:
 
 ```yaml
 kind: Cluster
@@ -117,17 +103,13 @@ nodes:
   - role: worker
 ```
 
-Create the cluster:
+Create and verify the cluster:
 
 ```bash
 kind create cluster \
   --name data-platform-lab \
   --config kubernetes/kind-config.yaml
-```
 
-Verify it:
-
-```bash
 kubectl config current-context
 kubectl get nodes
 ```
@@ -140,12 +122,7 @@ kind-data-platform-lab
 
 ## Terraform infrastructure
 
-Terraform creates the Kubernetes namespaces used by the lab:
-
-- `spark`
-- `storage`
-
-Run manually when required:
+Terraform manages the `spark` and `storage` namespaces.
 
 ```bash
 cd terraform
@@ -154,13 +131,6 @@ terraform fmt
 terraform validate
 terraform plan
 terraform apply
-```
-
-Verify:
-
-```bash
-kubectl get namespaces
-terraform state list
 ```
 
 Do not commit Terraform state:
@@ -173,30 +143,7 @@ Do not commit Terraform state:
 crash.log
 ```
 
-## GitHub Actions self-hosted runner
-
-The runner is installed outside the repository, for example:
-
-```text
-~/github-runners/actions-runner/
-```
-
-The workflows target the Mac runner with:
-
-```yaml
-runs-on: [self-hosted, macOS, ARM64]
-```
-
-Keep the runner listening when Actions jobs need to run:
-
-```bash
-cd ~/github-runners/actions-runner
-./run.sh
-```
-
 ## Spark image
-
-The Spark image packages PySpark jobs for Kubernetes.
 
 `spark/Dockerfile`:
 
@@ -208,18 +155,14 @@ COPY jobs/ /opt/spark/jobs/
 USER 185
 ```
 
-Build it locally:
+Build and load the image into kind:
 
 ```bash
 docker build \
   --platform linux/arm64 \
   -t data-platform-spark:latest \
   ./spark
-```
 
-Load it into every kind node:
-
-```bash
 kind load docker-image \
   data-platform-spark:latest \
   --name data-platform-lab
@@ -227,9 +170,7 @@ kind load docker-image \
 
 ## Spark RBAC
 
-The Spark service account needs permission to manage driver and executor resources in the `spark` namespace.
-
-The role should include `deletecollection`, because Spark uses collection deletion during cleanup.
+`kubernetes/spark/spark-rbac.yaml` should grant the Spark service account permission to manage Spark resources:
 
 ```yaml
 apiVersion: v1
@@ -283,68 +224,11 @@ Apply it:
 kubectl apply -f kubernetes/spark/spark-rbac.yaml
 ```
 
-Verify permissions:
-
-```bash
-kubectl auth can-i create pods \
-  --as=system:serviceaccount:spark:spark \
-  --namespace=spark
-
-kubectl auth can-i deletecollection pods \
-  --as=system:serviceaccount:spark:spark \
-  --namespace=spark
-```
-
-## Example Spark job
-
-`spark/jobs/hello_spark.py`:
-
-```python
-from pyspark.sql import SparkSession
-
-spark = (
-    SparkSession.builder
-    .appName("data-platform-lab")
-    .getOrCreate()
-)
-
-df = spark.range(0, 10_000_000)
-
-print(f"Count: {df.count()}")
-
-(
-    df.groupBy((df.id % 10).alias("bucket"))
-      .count()
-      .orderBy("bucket")
-      .show()
-)
-
-spark.stop()
-```
-
-A successful Kubernetes run creates one driver and two executors:
-
-```bash
-kubectl get pods -n spark -o wide
-```
-
-Inspect the latest driver log:
-
-```bash
-DRIVER=$(kubectl get pods \
-  -n spark \
-  -l spark-role=driver \
-  --sort-by=.metadata.creationTimestamp \
-  -o name | tail -1)
-
-kubectl logs -n spark "$DRIVER"
-```
-
 ## JupyterLab image
 
-Use a custom Jupyter image so Java and PySpark survive container recreation.
+Create the JupyterLab image with Java and PySpark already installed.
 
-### Jupyter Dockerfile
+`Dockerfile`:
 
 ```dockerfile
 FROM quay.io/jupyter/base-notebook:latest
@@ -362,7 +246,7 @@ RUN python -m pip install --no-cache-dir \
     pyspark==4.2.0
 ```
 
-### Jupyter Compose configuration
+`docker-compose.yml`:
 
 ```yaml
 services:
@@ -380,7 +264,7 @@ services:
 
     volumes:
       - ./notebooks:/home/jovyan/work
-      - ~/.kube:/home/jovyan/.kube:ro
+      - /Users/vx53cd/.kube:/home/jovyan/.kube:ro
 
     environment:
       - JUPYTER_ENABLE_LAB=yes
@@ -399,43 +283,154 @@ docker compose build --no-cache
 docker compose up -d
 ```
 
-Connect JupyterLab to the kind Docker network:
+---
+
+# HOW TO: Connect JupyterLab to the Spark cluster
+
+This procedure uses JupyterLab as the Spark driver while Kubernetes runs the Spark executor pods.
+
+## 1. Confirm that kind is running
+
+```bash
+kubectl config current-context
+kubectl get nodes
+kubectl get namespace spark
+```
+
+The context should be:
+
+```text
+kind-data-platform-lab
+```
+
+All three nodes should be `Ready`.
+
+## 2. Export the kind CA certificate
+
+Java must trust the certificate presented by the kind Kubernetes API server.
+
+Run on the Mac:
+
+```bash
+kubectl config view \
+  --raw \
+  --minify \
+  --flatten \
+  -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' \
+  | base64 --decode \
+  > /Users/vx53cd/.kube/kind-data-platform-lab-ca.crt
+```
+
+Verify it:
+
+```bash
+head -1 /Users/vx53cd/.kube/kind-data-platform-lab-ca.crt
+```
+
+Expected output:
+
+```text
+-----BEGIN CERTIFICATE-----
+```
+
+## 3. Recreate JupyterLab with the kubeconfig mount
+
+The Compose configuration must include:
+
+```yaml
+volumes:
+  - ./notebooks:/home/jovyan/work
+  - /Users/vx53cd/.kube:/home/jovyan/.kube:ro
+```
+
+Recreate the container:
+
+```bash
+docker compose down
+docker compose up -d --build
+```
+
+## 4. Connect JupyterLab to the kind network
 
 ```bash
 docker network connect kind jupyterlab
 ```
 
-Verify the runtime:
+If Docker says the endpoint already exists, the container is already connected.
+
+Verify the connection:
+
+```bash
+docker inspect jupyterlab \
+  --format '{{json .NetworkSettings.Networks}}'
+```
+
+## 5. Verify the mounted Kubernetes files
+
+```bash
+docker inspect jupyterlab \
+  --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
+
+docker exec jupyterlab \
+  ls -l /home/jovyan/.kube/config
+
+docker exec jupyterlab \
+  ls -l /home/jovyan/.kube/kind-data-platform-lab-ca.crt
+```
+
+Verify Java and PySpark:
 
 ```bash
 docker exec jupyterlab java -version
-docker exec jupyterlab python -c "import pyspark; print(pyspark.__version__)"
-docker port jupyterlab
+
+docker exec jupyterlab \
+  python -c "import pyspark; print(pyspark.__version__)"
 ```
 
-Open JupyterLab:
+Expected PySpark version:
+
+```text
+4.2.0
+```
+
+## 6. Open JupyterLab
+
+Open:
 
 ```text
 http://127.0.0.1:8888
 ```
 
-## Connect a notebook to Spark on Kubernetes
+Restart the notebook kernel before creating the Kubernetes Spark session. This prevents reuse of an older `local[2]` SparkContext.
 
-In this mode, JupyterLab is the Spark driver and Kubernetes runs the executors.
+## 7. Create the Kubernetes Spark session
 
-Restart the notebook kernel before creating a new Spark context.
+Run this as the first Spark cell:
 
 ```python
+from pathlib import Path
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
+
+ca_file = "/home/jovyan/.kube/kind-data-platform-lab-ca.crt"
+assert Path(ca_file).exists(), f"CA certificate not found: {ca_file}"
 
 spark = (
     SparkSession.builder
     .master("k8s://https://data-platform-lab-control-plane:6443")
-    .appName("jupyter-distributed-test")
+    .appName("jupyter-k8s-test")
     .config("spark.kubernetes.namespace", "spark")
-    .config("spark.kubernetes.container.image", "data-platform-spark:latest")
-    .config("spark.kubernetes.container.image.pullPolicy", "Never")
+    .config(
+        "spark.kubernetes.container.image",
+        "data-platform-spark:latest",
+    )
+    .config(
+        "spark.kubernetes.container.image.pullPolicy",
+        "Never",
+    )
+    .config(
+        "spark.kubernetes.authenticate.caCertFile",
+        ca_file,
+    )
     .config(
         "spark.kubernetes.authenticate.driver.serviceAccountName",
         "spark",
@@ -451,125 +446,177 @@ spark = (
     .config("spark.ui.bindAddress", "0.0.0.0")
     .getOrCreate()
 )
-
-print("Spark version :", spark.version)
-print("Master        :", spark.sparkContext.master)
-print("Application   :", spark.sparkContext.appName)
-print("Application ID:", spark.sparkContext.applicationId)
-print("Spark UI      :", spark.sparkContext.uiWebUrl)
 ```
 
-Confirm that the master begins with:
-
-```text
-k8s://
-```
-
-## Distributed notebook test
+## 8. Verify Kubernetes execution
 
 ```python
-df = (
-    spark.range(20_000_000)
-    .withColumn("customer_group", col("id") % 10)
-    .withColumn("amount", (col("id") % 1000) + 1)
-)
-
-print("Partitions:", df.rdd.getNumPartitions())
-
-result = (
-    df.groupBy("customer_group")
-      .agg({"amount": "sum"})
-      .orderBy("customer_group")
-)
-
-result.show()
+print("Master:", spark.sparkContext.master)
+print("Application ID:", spark.sparkContext.applicationId)
+print("Spark UI:", spark.sparkContext.uiWebUrl)
 ```
 
-While the Spark session is running, inspect the executor pods:
-
-```bash
-kubectl get pods -n spark -o wide
-```
-
-## Spark UI
-
-The Spark UI is exposed from the Jupyter driver container:
+The master must be:
 
 ```text
-http://127.0.0.1:4040
+k8s://https://data-platform-lab-control-plane:6443
 ```
 
-Validate the published ports:
-
-```bash
-docker port jupyterlab
-```
-
-Expected mappings include:
-
-```text
-4040/tcp -> 127.0.0.1:4040
-8888/tcp -> 0.0.0.0:8888
-```
-
-The UI remains available only while the notebook SparkContext is alive.
-
-Useful tabs include:
-
-- Jobs
-- Stages
-- SQL
-- Storage
-- Environment
-- Executors
-
-## Stop the notebook Spark application
+If it displays `local[2]`, run:
 
 ```python
 spark.stop()
 ```
 
-Spark should then remove the executor resources. If cleanup returns RBAC errors, verify that the service account has `deletecollection` permission for pods, services, ConfigMaps, and persistent volume claims.
+Then restart the notebook kernel and create the Kubernetes Spark session again as the first Spark operation.
+
+## 9. Run the test job
+
+```python
+from pyspark.sql.functions import expr
+
+df = (
+    spark.range(1, 1_000_000)
+    .toDF("id")
+    .repartition(10)
+    .withColumn("square", expr("id * id"))
+    .cache()
+)
+
+df.take(10)
+```
+
+Verify the number of partitions:
+
+```python
+df.rdd.getNumPartitions()
+```
+
+Expected result:
+
+```text
+10
+```
+
+Materialize the complete cache:
+
+```python
+df.count()
+```
+
+## 10. Check the Kubernetes executor pods
+
+Run from the Mac while the notebook Spark session is active:
+
+```bash
+kubectl get pods -n spark -o wide
+```
+
+For a live view:
+
+```bash
+kubectl get pods -n spark -w
+```
+
+In Jupyter client mode, JupyterLab hosts the driver and Kubernetes creates the executor pods.
+
+## 11. Open the Spark UI
+
+Open:
+
+```text
+http://127.0.0.1:4040
+```
+
+Useful tabs for this test:
+
+- **Jobs**: actions triggered by `take()` and `count()`
+- **Stages**: the shuffle introduced by `repartition(10)`
+- **Executors**: the Kubernetes executor pods
+- **Storage**: the cached DataFrame after `count()`
+- **SQL**: the DataFrame query plans
+
+Verify Docker's port mapping:
+
+```bash
+docker port jupyterlab
+```
+
+Expected mapping:
+
+```text
+4040/tcp -> 127.0.0.1:4040
+```
+
+## 12. Stop the Spark session
+
+```python
+spark.stop()
+```
+
+Then verify executor cleanup:
+
+```bash
+kubectl get pods -n spark
+```
+
+## Troubleshooting
+
+### The notebook reports `local[2]`
+
+An existing local SparkContext was reused. Stop Spark, restart the kernel, and create the Kubernetes session as the first Spark operation.
+
+### `PKIX path building failed`
+
+Confirm that the CA file exists inside JupyterLab:
+
+```bash
+docker exec jupyterlab \
+  ls -l /home/jovyan/.kube/kind-data-platform-lab-ca.crt
+```
+
+Confirm the Spark builder contains:
+
+```python
+.config(
+    "spark.kubernetes.authenticate.caCertFile",
+    "/home/jovyan/.kube/kind-data-platform-lab-ca.crt",
+)
+```
+
+### Executor pods cannot connect to the driver
+
+Confirm that JupyterLab belongs to the `kind` Docker network:
+
+```bash
+docker network connect kind jupyterlab
+```
+
+Retain these driver settings:
+
+```python
+.config("spark.driver.host", "jupyterlab")
+.config("spark.driver.port", "7078")
+.config("spark.driver.blockManager.port", "7079")
+```
+
+### Spark UI is unavailable
+
+Confirm that Compose publishes port 4040, recreate JupyterLab, reconnect it to `kind`, restart the notebook kernel, and recreate the Spark session.
 
 ## Useful commands
 
 ```bash
-# Cluster status
 kubectl get nodes
 kubectl get pods -A
 kubectl get pods -n spark -o wide
-
-# Spark resources
 kubectl get serviceaccount,role,rolebinding -n spark
 
-# Docker networks
 docker network inspect kind
-docker inspect jupyterlab --format '{{json .NetworkSettings.Networks}}'
-
-# Jupyter runtime
+docker port jupyterlab
 docker exec jupyterlab java -version
 docker exec jupyterlab python -c "import pyspark; print(pyspark.__version__)"
-
-# Terraform
-cd terraform
-terraform fmt -check
-terraform validate
-terraform plan
-terraform state list
 ```
-
-## Current milestone
-
-The lab supports both execution patterns:
-
-1. **Cluster mode through GitHub Actions**
-   - GitHub Actions runs `spark-submit`.
-   - Kubernetes creates the Spark driver and executor pods.
-
-2. **Interactive client mode through JupyterLab**
-   - JupyterLab hosts the Spark driver.
-   - Kubernetes creates executor pods on the kind workers.
-   - The Spark UI is available locally on port 4040.
 
 ## Suggested next steps
 
