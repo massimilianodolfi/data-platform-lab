@@ -200,6 +200,81 @@ jobs:
             echo "Spark RBAC file not found; assuming Terraform manages RBAC."
           fi
 
+      - name: Verify MinIO on the Mac runner
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+
+          if ! docker ps --format '{{.Names}}' | grep -Fxq minio; then
+            echo "::error::MinIO container is not running. Run the Deploy MinIO Storage workflow first."
+            exit 1
+          fi
+
+          curl --fail --silent --show-error \
+            http://127.0.0.1:9000/minio/health/ready \
+            >/dev/null
+
+          echo "MinIO is ready on the Mac runner."
+
+      - name: Verify MinIO connectivity from Kubernetes
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+
+          TEST_POD="minio-connectivity-test"
+
+          cleanup() {
+            kubectl delete pod \
+              -n spark \
+              "${TEST_POD}" \
+              --ignore-not-found=true \
+              --wait=false \
+              >/dev/null 2>&1 || true
+          }
+
+          trap cleanup EXIT
+          cleanup
+
+          kubectl run "${TEST_POD}" \
+            -n spark \
+            --image=curlimages/curl:8.12.1 \
+            --restart=Never \
+            --command -- \
+            curl --fail --silent --show-error \
+              http://host.docker.internal:9000/minio/health/ready
+
+          for attempt in $(seq 1 60); do
+            phase=$(kubectl get pod \
+              -n spark \
+              "${TEST_POD}" \
+              -o jsonpath='{.status.phase}' \
+              2>/dev/null || true)
+
+            echo "Attempt ${attempt}: test pod phase=${phase:-unknown}"
+
+            if [[ "${phase}" == "Succeeded" ]]; then
+              kubectl logs -n spark "${TEST_POD}" || true
+              echo "Kubernetes pods can reach MinIO."
+              exit 0
+            fi
+
+            if [[ "${phase}" == "Failed" ]]; then
+              kubectl describe pod -n spark "${TEST_POD}" || true
+              kubectl logs -n spark "${TEST_POD}" || true
+              echo "::error::Kubernetes cannot reach MinIO at host.docker.internal:9000."
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          kubectl describe pod -n spark "${TEST_POD}" || true
+          kubectl logs -n spark "${TEST_POD}" || true
+          echo "::error::Timed out waiting for MinIO connectivity test."
+          exit 1
+
       - name: Connect JupyterLab to kind network
         shell: bash
         working-directory: .
@@ -259,10 +334,12 @@ jobs:
           {
             echo "## Spark infrastructure deployment"
             echo
-            echo "- Cluster: \`data-platform-lab\`"
-            echo "- Kubernetes context: \`kind-data-platform-lab\`"
-            echo "- Spark image: \`data-platform-spark:latest\`"
-            echo "- Runner architecture: \`$(uname -m)\`"
+            echo '- Cluster: `data-platform-lab`'
+            echo '- Kubernetes context: `kind-data-platform-lab`'
+            echo '- Spark image: `data-platform-spark:latest`'
+            echo '- MinIO endpoint from Kubernetes: `http://host.docker.internal:9000`'
+            echo '- Runner architecture: `$(uname -m)`'
             echo
-            echo "The kind control-plane and worker containers use the \`kindest/node\` image and normally display UTC. The custom timezone in \`spark/Dockerfile\` applies to Spark executor pods created from \`data-platform-spark:latest\`."
+            echo 'This workflow verifies MinIO connectivity but does not place MinIO credentials in Terraform state.'
+            echo 'The kind control-plane and worker containers use the `kindest/node` image and normally display UTC. The custom timezone in `spark/Dockerfile` applies to Spark executor pods created from `data-platform-spark:latest`.'
           } >> "$GITHUB_STEP_SUMMARY"
