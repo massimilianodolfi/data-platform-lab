@@ -1,0 +1,193 @@
+name: Deploy MinIO Storage
+
+run-name: Deploy MinIO storage requested by @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: data-platform-lab-storage
+  cancel-in-progress: false
+
+jobs:
+  deploy-storage:
+    name: Create and start MinIO
+    runs-on: [self-hosted, macOS, ARM64]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        shell: bash
+        env:
+          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${MINIO_ROOT_USER}" ]]; then
+            echo "::error::Repository secret MINIO_ROOT_USER is not configured."
+            exit 1
+          fi
+
+          if [[ -z "${MINIO_ROOT_PASSWORD}" ]]; then
+            echo "::error::Repository secret MINIO_ROOT_PASSWORD is not configured."
+            exit 1
+          fi
+
+          if [[ ${#MINIO_ROOT_PASSWORD} -lt 8 ]]; then
+            echo "::error::MINIO_ROOT_PASSWORD must contain at least 8 characters."
+            exit 1
+          fi
+
+      - name: Create persistent storage directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p storage/minio-data
+
+      - name: Create MinIO Compose configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > storage/docker-compose.yml <<'YAML'
+          services:
+            minio:
+              image: minio/minio:latest
+              container_name: minio
+              hostname: minio
+              command:
+                - server
+                - /data
+                - --console-address
+                - ":9001"
+              environment:
+                MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+                MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+                TZ: Europe/Amsterdam
+              ports:
+                - "127.0.0.1:9000:9000"
+                - "127.0.0.1:9001:9001"
+              volumes:
+                - ./minio-data:/data
+              restart: unless-stopped
+              healthcheck:
+                test:
+                  - CMD
+                  - curl
+                  - -f
+                  - http://localhost:9000/minio/health/live
+                interval: 5s
+                timeout: 5s
+                retries: 30
+          YAML
+
+      - name: Create runtime environment file
+        shell: bash
+        env:
+          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          {
+            printf 'MINIO_ROOT_USER=%s\n' "$MINIO_ROOT_USER"
+            printf 'MINIO_ROOT_PASSWORD=%s\n' "$MINIO_ROOT_PASSWORD"
+          } > storage/.env
+
+      - name: Start MinIO
+        shell: bash
+        working-directory: storage
+        run: |
+          set -euo pipefail
+          docker compose --env-file .env up -d --remove-orphans
+          docker compose ps
+
+      - name: Wait for MinIO health
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in $(seq 1 60); do
+            status=$(docker inspect minio \
+              --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+              2>/dev/null || true)
+
+            echo "Attempt ${attempt}: MinIO health=${status}"
+
+            if [[ "$status" == "healthy" ]]; then
+              exit 0
+            fi
+
+            if [[ "$status" == "unhealthy" ]]; then
+              docker logs --tail 100 minio || true
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          echo "::error::MinIO did not become healthy."
+          docker logs --tail 100 minio || true
+          exit 1
+
+      - name: Create buckets
+        shell: bash
+        env:
+          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          docker run --rm \
+            --entrypoint /bin/sh \
+            minio/mc:latest \
+            -c "
+              mc alias set lab \
+                http://host.docker.internal:9000 \
+                '$MINIO_ROOT_USER' \
+                '$MINIO_ROOT_PASSWORD' &&
+              mc mb --ignore-existing lab/raw &&
+              mc mb --ignore-existing lab/processed &&
+              mc mb --ignore-existing lab/checkpoints &&
+              mc mb --ignore-existing lab/spark-events &&
+              mc ls lab
+            "
+
+      - name: Verify MinIO API
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error \
+            http://127.0.0.1:9000/minio/health/ready
+          echo
+          echo "MinIO API is ready on http://127.0.0.1:9000"
+          echo "MinIO Console is ready on http://127.0.0.1:9001"
+
+      - name: Remove runtime credentials file
+        if: always()
+        shell: bash
+        run: |
+          rm -f storage/.env
+
+      - name: Write deployment summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## MinIO storage deployment'
+            echo
+            echo '- Container: `minio`'
+            echo '- API (Mac): `http://127.0.0.1:9000`'
+            echo '- Console (Mac): `http://127.0.0.1:9001`'
+            echo '- Persistent data: `storage/minio-data` on the self-hosted runner'
+            echo '- Buckets: `raw`, `processed`, `checkpoints`, `spark-events`'
+            echo
+            echo 'The workflow removes the temporary `.env` file after deployment. The running container retains its configured environment until it is recreated.'
+          } >> "$GITHUB_STEP_SUMMARY"
