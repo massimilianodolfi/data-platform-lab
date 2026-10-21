@@ -1,4 +1,4 @@
-name: Deploy Spark
+name: Deploy Spark Software
 
 on:
   workflow_dispatch:

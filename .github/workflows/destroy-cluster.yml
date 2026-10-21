@@ -1,0 +1,137 @@
+name: Destroy Spark kind Cluster
+
+run-name: Destroy data-platform-lab requested by @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Type DELETE-data-platform-lab to confirm destruction'
+        required: true
+        type: string
+      stop_jupyterlab:
+        description: 'Also stop the JupyterLab Docker container'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: data-platform-lab-cluster-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  destroy-cluster:
+    name: Delete kind cluster and Kubernetes workloads
+    runs-on: [self-hosted, macOS, ARM64]
+
+    steps:
+      - name: Validate confirmation
+        shell: bash
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+
+          expected='DELETE-data-platform-lab'
+
+          if [[ "$CONFIRMATION" != "$expected" ]]; then
+            echo "::error::Confirmation did not match. Enter: $expected"
+            exit 1
+          fi
+
+      - name: Show resources scheduled for deletion
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo 'Existing kind clusters:'
+          kind get clusters || true
+
+          if kind get clusters 2>/dev/null | grep -Fxq 'data-platform-lab'; then
+            echo
+            echo 'Kubernetes nodes:'
+            kubectl --context kind-data-platform-lab get nodes -o wide || true
+
+            echo
+            echo 'Spark namespace workloads:'
+            kubectl --context kind-data-platform-lab \
+              get pods,services,configmaps,persistentvolumeclaims \
+              -n spark -o wide || true
+          else
+            echo 'The data-platform-lab cluster does not currently exist.'
+          fi
+
+      - name: Stop Spark workloads gracefully
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if kind get clusters 2>/dev/null | grep -Fxq 'data-platform-lab'; then
+            kubectl --context kind-data-platform-lab \
+              delete pods --all -n spark \
+              --ignore-not-found=true \
+              --wait=true \
+              --timeout=60s || true
+          fi
+
+      - name: Delete kind cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if kind get clusters 2>/dev/null | grep -Fxq 'data-platform-lab'; then
+            kind delete cluster --name data-platform-lab
+          else
+            echo 'Nothing to delete: data-platform-lab does not exist.'
+          fi
+
+      - name: Stop JupyterLab container
+        if: ${{ inputs.stop_jupyterlab }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if docker ps -a --format '{{.Names}}' | grep -Fxq 'jupyterlab'; then
+            docker stop jupyterlab
+          else
+            echo 'JupyterLab container does not exist.'
+          fi
+
+      - name: Verify cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if kind get clusters 2>/dev/null | grep -Fxq 'data-platform-lab'; then
+            echo '::error::The data-platform-lab cluster still exists.'
+            exit 1
+          fi
+
+          stale_nodes=$(docker ps -a --format '{{.Names}}' | grep '^data-platform-lab-' || true)
+          if [[ -n "$stale_nodes" ]]; then
+            echo '::warning::Found containers whose names still start with data-platform-lab-:'
+            echo "$stale_nodes"
+          fi
+
+          echo 'Cleanup complete.'
+          echo 'Remaining kind clusters:'
+          kind get clusters || true
+
+      - name: Write workflow summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Spark lab destruction'
+            echo
+            echo '- Cluster: `data-platform-lab`'
+            echo '- Kubernetes context: `kind-data-platform-lab`'
+            echo '- JupyterLab stop requested: `${{ inputs.stop_jupyterlab }}`'
+            echo
+            echo 'Deleting the kind cluster removes its control-plane container, worker containers, namespaces, pods, services, ConfigMaps, and other in-cluster resources.'
+            echo
+            echo '> This workflow does not delete repository files, Terraform state files, Docker images, notebook files, or the JupyterLab container unless the optional stop input is selected.'
+          } >> "$GITHUB_STEP_SUMMARY"

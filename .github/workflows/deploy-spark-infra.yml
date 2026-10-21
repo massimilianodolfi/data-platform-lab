@@ -1,4 +1,4 @@
-name: Deploy Spark Platform
+name: Deploy Spark Infrastructure
 
 on:
   workflow_dispatch:
