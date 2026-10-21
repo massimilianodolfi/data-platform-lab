@@ -58,7 +58,7 @@ jobs:
           cat > storage/docker-compose.yml <<'YAML'
           services:
             minio:
-              image: alpine/minio:RELEASE.2025-10-15T17-29-55Z
+              image: minio/minio:latest
               container_name: minio
               hostname: minio
               command:
@@ -76,6 +76,15 @@ jobs:
               volumes:
                 - ./minio-data:/data
               restart: unless-stopped
+              healthcheck:
+                test:
+                  - CMD
+                  - curl
+                  - -f
+                  - http://localhost:9000/minio/health/live
+                interval: 5s
+                timeout: 5s
+                retries: 30
           YAML
 
       - name: Create runtime environment file
@@ -106,25 +115,26 @@ jobs:
           set -euo pipefail
 
           for attempt in $(seq 1 60); do
-            if curl \
-              --fail \
-              --silent \
-              http://127.0.0.1:9000/minio/health/ready \
-              >/dev/null
-            then
-              echo "MinIO is ready."
+            status=$(docker inspect minio \
+              --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+              2>/dev/null || true)
+
+            echo "Attempt ${attempt}: MinIO health=${status}"
+
+            if [[ "$status" == "healthy" ]]; then
               exit 0
             fi
 
-            echo "Attempt ${attempt}: waiting for MinIO..."
+            if [[ "$status" == "unhealthy" ]]; then
+              docker logs --tail 100 minio || true
+              exit 1
+            fi
+
             sleep 2
           done
 
-          echo "::error::MinIO did not become ready."
-
-          docker ps -a --filter name=minio
+          echo "::error::MinIO did not become healthy."
           docker logs --tail 100 minio || true
-
           exit 1
 
       - name: Create buckets
@@ -135,38 +145,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          for bucket in \
-            raw \
-            processed \
-            checkpoints \
-            spark-events
-          do
-            echo "Checking bucket: ${bucket}"
-
-            if docker run --rm \
-              -e AWS_ACCESS_KEY_ID="$MINIO_ROOT_USER" \
-              -e AWS_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD" \
-              -e AWS_DEFAULT_REGION="us-east-1" \
-              amazon/aws-cli:2.38.3 \
-              --endpoint-url http://host.docker.internal:9000 \
-              s3api head-bucket \
-              --bucket "$bucket" \
-              >/dev/null 2>&1
-            then
-              echo "Bucket already exists: ${bucket}"
-            else
-              echo "Creating bucket: ${bucket}"
-
-              docker run --rm \
-                -e AWS_ACCESS_KEY_ID="$MINIO_ROOT_USER" \
-                -e AWS_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD" \
-                -e AWS_DEFAULT_REGION="us-east-1" \
-                amazon/aws-cli:2.38.3 \
-                --endpoint-url http://host.docker.internal:9000 \
-                s3api create-bucket \
-                --bucket "$bucket"
-            fi
-          done
+          docker run --rm \
+            --entrypoint /bin/sh \
+            minio/mc:latest \
+            -c "
+              mc alias set lab \
+                http://host.docker.internal:9000 \
+                '$MINIO_ROOT_USER' \
+                '$MINIO_ROOT_PASSWORD' &&
+              mc mb --ignore-existing lab/raw &&
+              mc mb --ignore-existing lab/processed &&
+              mc mb --ignore-existing lab/checkpoints &&
+              mc mb --ignore-existing lab/spark-events &&
+              mc ls lab
+            "
 
       - name: Verify MinIO API
         shell: bash
@@ -199,19 +191,3 @@ jobs:
             echo
             echo 'The workflow removes the temporary `.env` file after deployment. The running container retains its configured environment until it is recreated.'
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: List MinIO buckets
-        shell: bash
-        env:
-          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
-          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
-        run: |
-          set -euo pipefail
-
-          docker run --rm \
-            -e AWS_ACCESS_KEY_ID="$MINIO_ROOT_USER" \
-            -e AWS_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD" \
-            -e AWS_DEFAULT_REGION="us-east-1" \
-            amazon/aws-cli:2.38.3 \
-            --endpoint-url http://host.docker.internal:9000 \
-            s3api list-buckets

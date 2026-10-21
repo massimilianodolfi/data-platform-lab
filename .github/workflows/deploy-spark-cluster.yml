@@ -3,6 +3,9 @@ name: Deploy Spark Software
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: spark-data-platform-lab
   cancel-in-progress: false
@@ -10,71 +13,198 @@ concurrency:
 jobs:
   deploy-spark:
     name: Deploy Spark on Kubernetes
-
     runs-on: [self-hosted, macOS, ARM64]
 
-    steps:
+    env:
+      MINIO_ENDPOINT: http://host.docker.internal:9000
+      MINIO_ACCESS_KEY: ${{ secrets.MINIO_ROOT_USER }}
+      MINIO_SECRET_KEY: ${{ secrets.MINIO_ROOT_PASSWORD }}
 
+    steps:
       # -------------------------------------------------------
       # Checkout
       # -------------------------------------------------------
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # -------------------------------------------------------
-      # Verify environment
+      # Verify environment and MinIO
       # -------------------------------------------------------
-
       - name: Verify Kubernetes cluster
+        shell: bash
         run: |
+          set -euo pipefail
+
           echo "Kubernetes context:"
           kubectl config current-context
 
           echo
           echo "Nodes:"
-          kubectl get nodes
+          kubectl get nodes -o wide
 
           echo
           echo "Spark namespace:"
           kubectl get namespace spark
 
+      - name: Validate MinIO credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${MINIO_ACCESS_KEY}" ]]; then
+            echo "::error::Repository secret MINIO_ROOT_USER is not configured."
+            exit 1
+          fi
+
+          if [[ -z "${MINIO_SECRET_KEY}" ]]; then
+            echo "::error::Repository secret MINIO_ROOT_PASSWORD is not configured."
+            exit 1
+          fi
+
+      - name: Verify MinIO API from Mac
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl --fail --silent --show-error \
+            http://127.0.0.1:9000/minio/health/ready \
+            >/dev/null
+
+          echo "MinIO API is ready."
+
+      - name: Verify MinIO API from Kubernetes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TEST_POD="minio-connectivity-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          cleanup() {
+            kubectl delete pod \
+              -n spark \
+              "$TEST_POD" \
+              --ignore-not-found=true \
+              --wait=false \
+              >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          kubectl run "$TEST_POD" \
+            -n spark \
+            --image=curlimages/curl:8.12.1 \
+            --restart=Never \
+            --command -- \
+            curl --fail --silent --show-error \
+              "${MINIO_ENDPOINT}/minio/health/ready"
+
+          for attempt in $(seq 1 60); do
+            phase=$(kubectl get pod \
+              -n spark \
+              "$TEST_POD" \
+              -o jsonpath='{.status.phase}' \
+              2>/dev/null || true)
+
+            case "$phase" in
+              Succeeded)
+                echo "Kubernetes pods can reach MinIO."
+                kubectl logs -n spark "$TEST_POD" || true
+                exit 0
+                ;;
+              Failed)
+                kubectl describe pod -n spark "$TEST_POD" || true
+                kubectl logs -n spark "$TEST_POD" || true
+                exit 1
+                ;;
+              *)
+                echo "Attempt ${attempt}: connectivity pod phase=${phase:-Pending}"
+                sleep 2
+                ;;
+            esac
+          done
+
+          echo "::error::Timed out checking MinIO connectivity from Kubernetes."
+          kubectl describe pod -n spark "$TEST_POD" || true
+          exit 1
+
       # -------------------------------------------------------
       # Spark image
       # -------------------------------------------------------
-
       - name: Build Spark image
+        shell: bash
         run: |
+          set -euo pipefail
+
           docker build \
             --platform linux/arm64 \
             -t data-platform-spark:latest \
             ./spark
 
+      - name: Verify S3A support in Spark image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker run --rm \
+            data-platform-spark:latest \
+            sh -c '
+              found=0
+              for jar in /opt/spark/jars/hadoop-aws-*.jar; do
+                if [ -f "$jar" ]; then
+                  echo "Found S3A connector: $jar"
+                  found=1
+                fi
+              done
+
+              if [ "$found" -ne 1 ]; then
+                echo "ERROR: hadoop-aws JAR is missing from /opt/spark/jars."
+                exit 1
+              fi
+            '
+
       # -------------------------------------------------------
       # Load image into kind
       # -------------------------------------------------------
-
       - name: Load Spark image into kind
+        shell: bash
         run: |
+          set -euo pipefail
+
           kind load docker-image \
             data-platform-spark:latest \
             --name data-platform-lab
 
       # -------------------------------------------------------
-      # RBAC
+      # RBAC and MinIO secret
       # -------------------------------------------------------
-
       - name: Configure Spark RBAC
+        shell: bash
         run: |
+          set -euo pipefail
+
           kubectl apply \
             -f kubernetes/spark/spark-rbac.yaml
+
+      - name: Create MinIO credentials secret
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl create secret generic minio-credentials \
+            --namespace spark \
+            --from-literal=MINIO_ACCESS_KEY="$MINIO_ACCESS_KEY" \
+            --from-literal=MINIO_SECRET_KEY="$MINIO_SECRET_KEY" \
+            --dry-run=client \
+            -o yaml \
+            | kubectl apply -f -
 
       # -------------------------------------------------------
       # Verify permissions
       # -------------------------------------------------------
-
       - name: Verify Spark permissions
+        shell: bash
         run: |
+          set -euo pipefail
+
           kubectl auth can-i create pods \
             --as=system:serviceaccount:spark:spark \
             --namespace=spark
@@ -82,13 +212,17 @@ jobs:
           kubectl auth can-i create services \
             --as=system:serviceaccount:spark:spark \
             --namespace=spark
-          
+
           kubectl auth can-i create configmaps \
             --as=system:serviceaccount:spark:spark \
             --namespace=spark
 
       - name: Prepare Kubernetes credentials for Spark
+        shell: bash
         run: |
+          set -euo pipefail
+
+          rm -rf /tmp/spark-k8s
           mkdir -p /tmp/spark-k8s
 
           kubectl config view \
@@ -105,61 +239,55 @@ jobs:
             | base64 --decode \
             > /tmp/spark-k8s/ca.crt
 
-           echo "Kubernetes CA certificate created:"
-           ls -l /tmp/spark-k8s/ca.crt
-            
-      # -------------------------------------------------------
-      # Submit Spark application
-      # -------------------------------------------------------
+          echo "Kubernetes CA certificate created:"
+          ls -l /tmp/spark-k8s/ca.crt
 
-#      - name: Submit Spark application
-#        run: |
-#          docker run --rm \
-#            --network kind \
-#            -v "$HOME/.kube:/root/.kube:ro" \
-#            data-platform-spark:latest \
-#            /opt/spark/bin/spark-submit \
-#            --master k8s://https://data-platform-lab-control-plane:6443 \
-#            --deploy-mode cluster \
-#            --name data-platform-lab \
-#            --conf spark.kubernetes.namespace=spark \
-#            --conf spark.kubernetes.authenticate.submission.caCertFile=/spark-k8s/ca.crt \
-#            --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \
-#            --conf spark.kubernetes.container.image=data-platform-spark:latest \
-#            --conf spark.kubernetes.container.image.pullPolicy=Never \
-#            --conf spark.executor.instances=2 \
-#            --conf spark.driver.memory=1g \
-#            --conf spark.executor.memory=2g \
-#            --conf spark.executor.cores=1 \
-#            local:///opt/spark/jobs/hello_spark.py
-
+      # -------------------------------------------------------
+      # Submit Spark application with MinIO/S3A configuration
+      # -------------------------------------------------------
       - name: Submit Spark application
+        shell: bash
         run: |
+          set -euo pipefail
+
           docker run --rm \
-          --network kind \
-          -v /tmp/spark-k8s:/spark-k8s:ro \
-          -e KUBECONFIG=/spark-k8s/config \
-          data-platform-spark:latest \
-          /opt/spark/bin/spark-submit \
-          --master k8s://https://data-platform-lab-control-plane:6443 \
-          --deploy-mode cluster \
-          --name data-platform-lab \
-          --conf spark.kubernetes.namespace=spark \
-          --conf spark.kubernetes.authenticate.submission.caCertFile=/spark-k8s/ca.crt \
-          --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \
-          --conf spark.kubernetes.container.image=data-platform-spark:latest \
-          --conf spark.kubernetes.container.image.pullPolicy=Never \
-          --conf spark.executor.instances=2 \
-          --conf spark.driver.memory=1g \
-          --conf spark.executor.memory=2g \
-          --conf spark.executor.cores=1 \
-          local:///opt/spark/jobs/hello_spark.py     
+            --network kind \
+            -v /tmp/spark-k8s:/spark-k8s:ro \
+            -e KUBECONFIG=/spark-k8s/config \
+            data-platform-spark:latest \
+            /opt/spark/bin/spark-submit \
+            --master k8s://https://data-platform-lab-control-plane:6443 \
+            --deploy-mode cluster \
+            --name data-platform-lab \
+            --conf spark.kubernetes.namespace=spark \
+            --conf spark.kubernetes.authenticate.submission.caCertFile=/spark-k8s/ca.crt \
+            --conf spark.kubernetes.authenticate.driver.serviceAccountName=spark \
+            --conf spark.kubernetes.container.image=data-platform-spark:latest \
+            --conf spark.kubernetes.container.image.pullPolicy=Never \
+            --conf spark.kubernetes.driver.secretKeyRef.MINIO_ACCESS_KEY=minio-credentials:MINIO_ACCESS_KEY \
+            --conf spark.kubernetes.driver.secretKeyRef.MINIO_SECRET_KEY=minio-credentials:MINIO_SECRET_KEY \
+            --conf spark.kubernetes.executor.secretKeyRef.MINIO_ACCESS_KEY=minio-credentials:MINIO_ACCESS_KEY \
+            --conf spark.kubernetes.executor.secretKeyRef.MINIO_SECRET_KEY=minio-credentials:MINIO_SECRET_KEY \
+            --conf spark.hadoop.fs.s3a.endpoint=${MINIO_ENDPOINT} \
+            --conf spark.hadoop.fs.s3a.path.style.access=true \
+            --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+            --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+            --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider \
+            --conf spark.hadoop.fs.s3a.access.key=${MINIO_ACCESS_KEY} \
+            --conf spark.hadoop.fs.s3a.secret.key=${MINIO_SECRET_KEY} \
+            --conf spark.sql.session.timeZone=Europe/Amsterdam \
+            --conf spark.executor.instances=2 \
+            --conf spark.driver.memory=1g \
+            --conf spark.executor.memory=2g \
+            --conf spark.executor.cores=1 \
+            local:///opt/spark/jobs/hello_spark.py
+
       # -------------------------------------------------------
       # Inspect deployment
       # -------------------------------------------------------
-
       - name: Show Spark pods
         if: always()
+        shell: bash
         run: |
           echo "Spark pods:"
           kubectl get pods -n spark -o wide
@@ -167,9 +295,9 @@ jobs:
       # -------------------------------------------------------
       # Driver logs
       # -------------------------------------------------------
-
       - name: Show Spark driver logs
         if: always()
+        shell: bash
         run: |
           DRIVER=$(kubectl get pods \
             -n spark \
@@ -177,7 +305,7 @@ jobs:
             --sort-by=.metadata.creationTimestamp \
             -o name | tail -1)
 
-          if [ -n "$DRIVER" ]; then
+          if [[ -n "$DRIVER" ]]; then
             echo "Spark driver: $DRIVER"
             kubectl logs -n spark "$DRIVER"
           else
