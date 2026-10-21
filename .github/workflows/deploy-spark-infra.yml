@@ -28,6 +28,39 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
+      
+      - name: Ensure kind cluster exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CLUSTER_NAME="data-platform-lab"
+          CONTEXT_NAME="kind-${CLUSTER_NAME}"
+          KIND_CONFIG="kubernetes/kind-config.yaml"
+
+          echo "Existing kind clusters:"
+          kind get clusters || true
+
+          if kind get clusters 2>/dev/null | grep -Fxq "${CLUSTER_NAME}"; then
+            echo "kind cluster ${CLUSTER_NAME} already exists."
+          else
+            echo "Creating kind cluster ${CLUSTER_NAME}..."
+
+            kind create cluster \
+              --name "${CLUSTER_NAME}" \
+              --config "${KIND_CONFIG}" \
+              --wait 300s
+          fi
+
+          echo "Selecting Kubernetes context ${CONTEXT_NAME}..."
+          kubectl config use-context "${CONTEXT_NAME}"
+
+          echo "Current context:"
+          kubectl config current-context
+
+          echo "Cluster nodes:"
+          kubectl get nodes -o wide
+
 
       # ---------------------------------------------------------
       # 2. Restore latest Terraform state
