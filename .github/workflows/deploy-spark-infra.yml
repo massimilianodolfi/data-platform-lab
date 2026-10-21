@@ -7,7 +7,6 @@ permissions:
   contents: read
   actions: read
 
-# Only one Terraform deployment may manipulate this state at a time
 concurrency:
   group: terraform-data-platform-lab
   cancel-in-progress: false
@@ -22,13 +21,9 @@ jobs:
         working-directory: terraform
 
     steps:
-      # ---------------------------------------------------------
-      # 1. Checkout
-      # ---------------------------------------------------------
-
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Ensure kind cluster exists
         shell: bash
         working-directory: .
@@ -39,6 +34,15 @@ jobs:
           CONTEXT_NAME="kind-${CLUSTER_NAME}"
           KIND_CONFIG="kubernetes/kind-config.yaml"
 
+          echo "Repository root:"
+          pwd
+
+          if [[ ! -f "${KIND_CONFIG}" ]]; then
+            echo "::error::kind configuration not found: ${KIND_CONFIG}"
+            find . -maxdepth 4 -type f | sort
+            exit 1
+          fi
+
           echo "Existing kind clusters:"
           kind get clusters || true
 
@@ -46,26 +50,15 @@ jobs:
             echo "kind cluster ${CLUSTER_NAME} already exists."
           else
             echo "Creating kind cluster ${CLUSTER_NAME}..."
-
             kind create cluster \
               --name "${CLUSTER_NAME}" \
               --config "${KIND_CONFIG}" \
               --wait 300s
           fi
 
-          echo "Selecting Kubernetes context ${CONTEXT_NAME}..."
           kubectl config use-context "${CONTEXT_NAME}"
-
-          echo "Current context:"
           kubectl config current-context
-
-          echo "Cluster nodes:"
           kubectl get nodes -o wide
-
-
-      # ---------------------------------------------------------
-      # 2. Restore latest Terraform state
-      # ---------------------------------------------------------
 
       - name: Restore latest Terraform state
         env:
@@ -86,102 +79,190 @@ jobs:
               | .[0].id // empty
             ')
 
-          if [ -z "$ARTIFACT_ID" ]; then
+          if [[ -z "${ARTIFACT_ID}" ]]; then
             echo "No previous Terraform state found."
             echo "Terraform will start with a new state."
             exit 0
           fi
 
-          echo "Restoring artifact ID: $ARTIFACT_ID"
+          echo "Restoring artifact ID: ${ARTIFACT_ID}"
 
           gh api \
             "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
             > /tmp/terraform-state.zip
 
           unzip -o /tmp/terraform-state.zip -d .
+          rm -f /tmp/terraform-state.zip
 
-          rm /tmp/terraform-state.zip
-
-          if [ -f terraform.tfstate ]; then
+          if [[ -f terraform.tfstate ]]; then
             echo "Terraform state restored successfully."
           else
-            echo "ERROR: Artifact did not contain terraform.tfstate."
+            echo "::error::Artifact did not contain terraform.tfstate."
             exit 1
           fi
 
-      # ---------------------------------------------------------
-      # 3. Verify M4 / Kubernetes environment
-      # ---------------------------------------------------------
-
       - name: Check environment
+        shell: bash
+        working-directory: .
         run: |
+          set -euo pipefail
+
           echo "Architecture:"
           uname -m
 
           echo "Terraform:"
           terraform version
 
+          echo "Docker:"
+          docker version --format 'Client={{.Client.Version}} Server={{.Server.Version}}'
+
+          echo "kind:"
+          kind version
+
           echo "Kubernetes context:"
           kubectl config current-context
 
           echo "Kubernetes nodes:"
-          kubectl get nodes
-
-      # ---------------------------------------------------------
-      # 4. Terraform validation
-      # ---------------------------------------------------------
+          kubectl get nodes -o wide
 
       - name: Terraform Format
         run: terraform fmt -check
 
       - name: Terraform Init
-        run: terraform init
+        run: terraform init -input=false
 
       - name: Terraform Validate
         run: terraform validate
 
-      # ---------------------------------------------------------
-      # 5. Plan and deploy
-      # ---------------------------------------------------------
-
       - name: Terraform Plan
-        run: terraform plan -out=tfplan
+        run: terraform plan -input=false -out=tfplan
 
       - name: Terraform Apply
-        run: terraform apply -auto-approve tfplan
+        run: terraform apply -input=false -auto-approve tfplan
 
-      # ---------------------------------------------------------
-      # 6. Verify resulting state
-      # ---------------------------------------------------------
+      - name: Build Spark image
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+
+          docker build \
+            --no-cache \
+            --platform linux/arm64 \
+            --label org.opencontainers.image.revision="${GITHUB_SHA}" \
+            --label org.opencontainers.image.created="$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            -t data-platform-spark:latest \
+            ./spark
+
+          echo "Local image:"
+          docker image inspect data-platform-spark:latest \
+            --format 'ID={{.Id}} Created={{.Created}}'
+
+          echo "Timezone validation inside built image:"
+          docker run --rm data-platform-spark:latest \
+            sh -c 'echo "TZ=${TZ:-unset}"; date; readlink -f /etc/localtime; cat /etc/timezone 2>/dev/null || true; java -XshowSettings:properties -version 2>&1 | grep user.timezone || true'
+
+      - name: Load Spark image into kind
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+
+          kind load docker-image \
+            data-platform-spark:latest \
+            --name data-platform-lab
+
+      - name: Verify Spark image on kind nodes
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+
+          for node in \
+            data-platform-lab-control-plane \
+            data-platform-lab-worker \
+            data-platform-lab-worker2
+          do
+            echo "=== ${node} ==="
+            docker exec "${node}" \
+              crictl images | grep data-platform-spark
+          done
+
+      - name: Apply Spark RBAC
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+
+          if [[ -f kubernetes/spark/spark-rbac.yaml ]]; then
+            kubectl apply -f kubernetes/spark/spark-rbac.yaml
+          else
+            echo "Spark RBAC file not found; assuming Terraform manages RBAC."
+          fi
+
+      - name: Connect JupyterLab to kind network
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+
+          if ! docker ps -a --format '{{.Names}}' | grep -Fxq 'jupyterlab'; then
+            echo "JupyterLab container does not exist; skipping network connection."
+            exit 0
+          fi
+
+          if docker inspect jupyterlab \
+            --format '{{json .NetworkSettings.Networks}}' \
+            | grep -q '"kind"'; then
+            echo "JupyterLab is already connected to the kind network."
+          else
+            docker network connect kind jupyterlab
+            echo "JupyterLab connected to the kind network."
+          fi
 
       - name: Show Terraform resources
         run: terraform state list
 
       - name: Check Kubernetes resources
+        shell: bash
+        working-directory: .
         run: |
-          kubectl get namespaces
-          kubectl get pods -A
+          set -euo pipefail
 
-      # ---------------------------------------------------------
-      # 7. Generate timestamp for artifact
-      # ---------------------------------------------------------
+          kubectl get nodes -o wide
+          kubectl get namespaces
+          kubectl get serviceaccount,role,rolebinding -n spark || true
+          kubectl get pods -A -o wide
 
       - name: Generate timestamp
         id: timestamp
         if: always()
+        shell: bash
         working-directory: .
         run: |
           echo "value=$(date -u +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
 
-      # ---------------------------------------------------------
-      # 8. Persist Terraform state
-      # ---------------------------------------------------------
-
       - name: Upload Terraform state
-        if: always()
+        if: ${{ always() && hashFiles('terraform/terraform.tfstate') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: terraform-state-${{ steps.timestamp.outputs.value }}
           path: terraform/terraform.tfstate
           retention-days: 90
-          if-no-files-found: ignore
+          if-no-files-found: error
+
+      - name: Deployment summary
+        if: always()
+        shell: bash
+        working-directory: .
+        run: |
+          {
+            echo "## Spark infrastructure deployment"
+            echo
+            echo "- Cluster: \`data-platform-lab\`"
+            echo "- Kubernetes context: \`kind-data-platform-lab\`"
+            echo "- Spark image: \`data-platform-spark:latest\`"
+            echo "- Runner architecture: \`$(uname -m)\`"
+            echo
+            echo "The kind control-plane and worker containers use the \`kindest/node\` image and normally display UTC. The custom timezone in \`spark/Dockerfile\` applies to Spark executor pods created from \`data-platform-spark:latest\`."
+          } >> "$GITHUB_STEP_SUMMARY"
