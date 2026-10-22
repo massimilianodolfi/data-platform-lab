@@ -44,11 +44,11 @@ jobs:
             exit 1
           fi
 
-      - name: Create persistent storage directory
+      - name: Create storage configuration directory
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p storage/minio-data
+          mkdir -p storage
 
       - name: Create MinIO Compose configuration
         shell: bash
@@ -58,36 +58,36 @@ jobs:
           cat > storage/docker-compose.yml <<'YAML'
           services:
             minio:
-              image: minio/minio:latest
+              image: alpine/minio:RELEASE.2025-10-15T17-29-55Z
               container_name: minio
               hostname: minio
+
               command:
                 - server
                 - /data
                 - --console-address
                 - ":9001"
+
               environment:
                 MINIO_ROOT_USER: ${MINIO_ROOT_USER}
                 MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
                 TZ: Europe/Amsterdam
+
               ports:
-                - "127.0.0.1:9000:9000"
+                # S3 API: available to the Mac and kind pods.
+                - "9000:9000"
+
+                # Administrative console: Mac access only.
                 - "127.0.0.1:9001:9001"
+
               volumes:
                 - minio-data:/data
+
               restart: unless-stopped
+
           volumes:
             minio-data:
-            name: data-platform-minio-data     
-              healthcheck:
-                test:
-                  - CMD
-                  - curl
-                  - -f
-                  - http://localhost:9000/minio/health/live
-                interval: 5s
-                timeout: 5s
-                retries: 30
+              name: data-platform-minio-data
           YAML
 
       - name: Create runtime environment file
@@ -109,7 +109,13 @@ jobs:
         working-directory: storage
         run: |
           set -euo pipefail
-          docker compose --env-file .env up -d --remove-orphans
+
+          docker compose \
+            --env-file .env \
+            up -d \
+            --force-recreate \
+            --remove-orphans
+
           docker compose ps
 
       - name: Wait for MinIO health
@@ -118,29 +124,67 @@ jobs:
           set -euo pipefail
 
           for attempt in $(seq 1 60); do
-            status=$(docker inspect minio \
-              --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
-              2>/dev/null || true)
-
-            echo "Attempt ${attempt}: MinIO health=${status}"
-
-            if [[ "$status" == "healthy" ]]; then
+            if curl \
+              --fail \
+              --silent \
+              http://127.0.0.1:9000/minio/health/ready \
+              >/dev/null
+            then
+              echo "MinIO is ready."
               exit 0
             fi
 
-            if [[ "$status" == "unhealthy" ]]; then
-              docker logs --tail 100 minio || true
-              exit 1
-            fi
-
+            echo "Attempt ${attempt}: waiting for MinIO..."
             sleep 2
           done
 
-          echo "::error::MinIO did not become healthy."
+          echo "::error::MinIO did not become ready."
+          docker ps -a --filter name=minio
           docker logs --tail 100 minio || true
           exit 1
 
-      - name: Create buckets
+      - name: Create MinIO buckets
+        shell: bash
+        env:
+          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          for bucket in \
+            raw \
+            processed \
+            checkpoints \
+            spark-events
+          do
+            echo "Checking bucket: ${bucket}"
+
+            if docker run --rm \
+              -e AWS_ACCESS_KEY_ID="$MINIO_ROOT_USER" \
+              -e AWS_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD" \
+              -e AWS_DEFAULT_REGION="us-east-1" \
+              amazon/aws-cli:2.38.3 \
+              --endpoint-url http://host.docker.internal:9000 \
+              s3api head-bucket \
+              --bucket "$bucket" \
+              >/dev/null 2>&1
+            then
+              echo "Bucket already exists: ${bucket}"
+            else
+              echo "Creating bucket: ${bucket}"
+
+              docker run --rm \
+                -e AWS_ACCESS_KEY_ID="$MINIO_ROOT_USER" \
+                -e AWS_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD" \
+                -e AWS_DEFAULT_REGION="us-east-1" \
+                amazon/aws-cli:2.38.3 \
+                --endpoint-url http://host.docker.internal:9000 \
+                s3api create-bucket \
+                --bucket "$bucket"
+            fi
+          done
+
+      - name: List MinIO buckets
         shell: bash
         env:
           MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
@@ -149,29 +193,104 @@ jobs:
           set -euo pipefail
 
           docker run --rm \
-            --entrypoint /bin/sh \
-            minio/mc:latest \
-            -c "
-              mc alias set lab \
-                http://host.docker.internal:9000 \
-                '$MINIO_ROOT_USER' \
-                '$MINIO_ROOT_PASSWORD' &&
-              mc mb --ignore-existing lab/raw &&
-              mc mb --ignore-existing lab/processed &&
-              mc mb --ignore-existing lab/checkpoints &&
-              mc mb --ignore-existing lab/spark-events &&
-              mc ls lab
-            "
+            -e AWS_ACCESS_KEY_ID="$MINIO_ROOT_USER" \
+            -e AWS_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD" \
+            -e AWS_DEFAULT_REGION="us-east-1" \
+            amazon/aws-cli:2.38.3 \
+            --endpoint-url http://host.docker.internal:9000 \
+            s3api list-buckets
 
-      - name: Verify MinIO API
+      - name: Verify MinIO API from Mac
         shell: bash
         run: |
           set -euo pipefail
-          curl --fail --silent --show-error \
-            http://127.0.0.1:9000/minio/health/ready
-          echo
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            http://127.0.0.1:9000/minio/health/ready \
+            >/dev/null
+
           echo "MinIO API is ready on http://127.0.0.1:9000"
           echo "MinIO Console is ready on http://127.0.0.1:9001"
+          echo "Spark endpoint is http://host.docker.internal:9000"
+
+      - name: Verify MinIO API from Kubernetes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! kubectl get namespace spark >/dev/null 2>&1; then
+            echo "Spark namespace does not exist."
+            echo "Skipping the Kubernetes connectivity test."
+            exit 0
+          fi
+
+          TEST_POD="minio-storage-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          cleanup() {
+            kubectl delete pod \
+              -n spark \
+              "$TEST_POD" \
+              --ignore-not-found=true \
+              --wait=false \
+              >/dev/null 2>&1 || true
+          }
+
+          trap cleanup EXIT
+
+          kubectl run "$TEST_POD" \
+            -n spark \
+            --image=curlimages/curl:8.12.1 \
+            --restart=Never \
+            --command -- \
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              http://host.docker.internal:9000/minio/health/ready
+
+          for attempt in $(seq 1 60); do
+            phase=$(kubectl get pod \
+              -n spark \
+              "$TEST_POD" \
+              -o jsonpath='{.status.phase}' \
+              2>/dev/null || true)
+
+            case "$phase" in
+              Succeeded)
+                echo "Kubernetes pods can reach MinIO."
+                kubectl logs -n spark "$TEST_POD" || true
+                exit 0
+                ;;
+
+              Failed)
+                kubectl describe pod -n spark "$TEST_POD" || true
+                kubectl logs -n spark "$TEST_POD" || true
+                exit 1
+                ;;
+
+              *)
+                echo "Attempt ${attempt}: pod phase=${phase:-Pending}"
+                sleep 2
+                ;;
+            esac
+          done
+
+          echo "::error::Timed out checking MinIO from Kubernetes."
+          kubectl describe pod -n spark "$TEST_POD" || true
+          exit 1
+
+      - name: Verify persistent Docker volume
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker volume inspect data-platform-minio-data
+
+          docker inspect minio \
+            --format '{{range .Mounts}}{{println .Type .Name .Destination}}{{end}}'
 
       - name: Remove runtime credentials file
         if: always()
@@ -187,10 +306,11 @@ jobs:
             echo '## MinIO storage deployment'
             echo
             echo '- Container: `minio`'
-            echo '- API (Mac): `http://127.0.0.1:9000`'
-            echo '- Console (Mac): `http://127.0.0.1:9001`'
-            echo '- Persistent data: `storage/minio-data` on the self-hosted runner'
+            echo '- API from Mac: `http://127.0.0.1:9000`'
+            echo '- API from Spark: `http://host.docker.internal:9000`'
+            echo '- Console from Mac: `http://127.0.0.1:9001`'
+            echo '- Persistent volume: `data-platform-minio-data`'
             echo '- Buckets: `raw`, `processed`, `checkpoints`, `spark-events`'
             echo
-            echo 'The workflow removes the temporary `.env` file after deployment. The running container retains its configured environment until it is recreated.'
+            echo 'The temporary `.env` file was removed after deployment.'
           } >> "$GITHUB_STEP_SUMMARY"
