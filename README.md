@@ -1,77 +1,76 @@
 # Data Platform Lab
 
-A local data-platform engineering lab for Apple Silicon, combining GitHub Actions, a self-hosted runner, Terraform, Docker, kind Kubernetes, Apache Spark, PySpark, JupyterLab, and MinIO-compatible S3 object storage.
+A local Spark data-platform lab on Apple Silicon using Docker Desktop, kind Kubernetes, Terraform, GitHub Actions, JupyterLab, Apache Spark 4.2, and MinIO-compatible S3 object storage.
 
 ## Architecture
 
 ```text
-GitHub repository
-       |
-       v
-GitHub Actions
-       |
-       v
-Self-hosted macOS ARM64 runner
-       |
-       +-----------------------------+
-       |                             |
-       v                             v
-Terraform                      Spark deployment
-       |                             |
-       v                             v
-kind Kubernetes cluster       Spark container image
-       |                        with Hadoop S3A
-       +--------------+--------------+
-                      |
-                      v
-                spark namespace
-                      |
-              +-------+-------+
-              |               |
-         Spark driver     Spark executors
-              |               |
-              +-------+-------+
-                      |
-                    S3A
-                      |
-                      v
-          MinIO-compatible S3 storage
-          host.docker.internal:9000
+GitHub Actions on self-hosted ARM64 Mac
+                |
+                +--> deploy-spark-infra.yml
+                |      Creates/reuses kind cluster
+                |      Applies Terraform infrastructure
+                |
+                +--> deploy-storage.yml
+                |      Creates/recreates MinIO container
+                |      Creates S3 buckets
+                |      Persists data in a Docker volume
+                |
+                +--> deploy-spark-cluster.yml
+                       Builds Spark image with S3A
+                       Loads image into kind
+                       Applies RBAC and MinIO credentials
+                       Submits Spark application
 
 JupyterLab container
-       |
-       | Spark client mode
-       v
-Notebook Spark driver
-       |
-       +-------> Executors on kind Kubernetes
-       |
-       +-------> MinIO through S3A
+  Spark driver in client mode
+          |
+          | Kubernetes API
+          v
+kind Kubernetes cluster
+  +-- control-plane
+  +-- worker
+  |    +-- Spark executor pod
+  +-- worker2
+       +-- Spark executor pod
+          |
+          | S3A
+          v
+MinIO S3 API
+  host.docker.internal:9000
+          |
+          v
+Persistent Docker volume
+  data-platform-minio-data
+```
 
-Components
-Apple Silicon Mac with 48 GB memory
-Docker Desktop
-kind Kubernetes cluster with one control-plane and two worker nodes
-Terraform Kubernetes provider
-GitHub Actions self-hosted ARM64 runner
-Apache Spark 4.2.0
-PySpark 4.2.0
-Java 21
-Python 3.10 for the Jupyter driver and Spark Python workers
-JupyterLab
-MinIO-compatible S3 object storage
-Hadoop S3A connector
-Repository structure
-Text
+## Components
+
+- Apple Silicon Mac
+- Docker Desktop
+- Self-hosted GitHub Actions runner with the labels:
+  - `self-hosted`
+  - `macOS`
+  - `ARM64`
+- kind Kubernetes cluster named `data-platform-lab`
+- Terraform Kubernetes provider
+- Apache Spark 4.2.0
+- PySpark 4.2.0
+- Java 21
+- Python 3.10 for the Jupyter driver and Spark Python workers
+- JupyterLab
+- MinIO-compatible S3 object storage
+
+## Repository layout
+
+```text
 data-platform-lab/
 ├── .github/
 │   └── workflows/
-│       ├── deploy-spark-cluster.yml
 │       ├── deploy-spark-infra.yml
+│       ├── deploy-spark-cluster.yml
 │       ├── deploy-storage.yml
-│       ├── destroy-spark-cluster.yml
-│       ├── terraform.yml
-│       └── test-runner.yml
+│       └── destroy-spark-cluster.yml
 ├── kubernetes/
 │   ├── kind-config.yaml
 │   └── spark/
@@ -80,8 +79,6 @@ data-platform-lab/
 │   ├── Dockerfile
 │   └── jobs/
 │       └── hello_spark.py
-├── storage/
-│   └── docker-compose.yml
 ├── terraform/
 │   ├── main.tf
 │   ├── outputs.tf
@@ -89,48 +86,106 @@ data-platform-lab/
 │   ├── variables.tf
 │   └── versions.tf
 └── README.md
+```
 
-Prerequisites
-Bash
-brew tap hashicorp/tap
-brew install hashicorp/tap/terraform
-brew install git gh kubectl kind helm jq python
+## GitHub repository secrets
 
+Configure the following secrets under:
 
-Docker Desktop must be installed and running.
+```text
+Settings
+→ Secrets and variables
+→ Actions
+→ Repository secrets
+```
 
-Configure these GitHub repository secrets:
+Required secrets:
 
-Text
+```text
 MINIO_ROOT_USER
 MINIO_ROOT_PASSWORD
+```
 
+Never commit MinIO credentials to the repository, Dockerfiles, notebooks, or Terraform files.
 
-Do not store MinIO credentials in the repository or in notebooks.
+If credentials are accidentally exposed, rotate `MINIO_ROOT_PASSWORD` and rerun the storage and Spark deployment workflows.
 
-Workflow order
+## Workflow order
 
-For a complete deployment, run the workflows in this order:
+For a clean deployment, run the workflows in this order:
 
-Text
+```text
 1. Deploy Spark Infrastructure
 2. Deploy MinIO Storage
 3. Deploy Spark Software
+```
 
+To delete Kubernetes compute:
 
-To remove the Kubernetes cluster and its pods, run:
-
-Text
+```text
 Destroy Spark kind Cluster
+```
 
+Deleting the kind cluster removes:
 
-MinIO is managed separately from kind so that object-storage data can survive Kubernetes cluster recreation.
+- the Kubernetes control plane;
+- the Kubernetes worker nodes;
+- Spark driver and executor pods;
+- namespaces;
+- services;
+- ConfigMaps;
+- in-cluster Kubernetes resources.
 
-Create the Kubernetes cluster
+MinIO storage is managed separately and should survive kind cluster recreation.
 
-kubernetes/kind-config.yaml:
+# Spark infrastructure
 
-Yaml
+The `deploy-spark-infra.yml` workflow:
+
+1. Checks out the repository.
+2. Ensures the `data-platform-lab` kind cluster exists.
+3. Uses `kubernetes/kind-config.yaml`.
+4. Selects the `kind-data-platform-lab` Kubernetes context.
+5. Restores the most recent Terraform state.
+6. Runs Terraform format, initialization, validation, planning, and apply.
+7. Verifies Kubernetes resources.
+8. Uploads Terraform state as a workflow artifact.
+
+## Terraform working directory
+
+The workflow has this job-level default:
+
+```yaml
+defaults:
+  run:
+    working-directory: terraform
+```
+
+Therefore, non-Terraform operations must explicitly run from the repository root:
+
+```yaml
+- name: Ensure kind cluster exists
+  shell: bash
+  working-directory: .
+```
+
+Without that override, this path:
+
+```text
+kubernetes/kind-config.yaml
+```
+
+would incorrectly be resolved as:
+
+```text
+terraform/kubernetes/kind-config.yaml
+```
+
+## kind configuration
+
+`kubernetes/kind-config.yaml`:
+
+```yaml
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 
@@ -138,104 +193,999 @@ nodes:
   - role: control-plane
   - role: worker
   - role: worker
+```
 
+Create the cluster manually if needed:
 
-Create and verify the cluster:
-
-Bash
+```bash
 kind create cluster \
   --name data-platform-lab \
-  --config kubernetes/kind-config.yaml
+  --config kubernetes/kind-config.yaml \
+  --wait 300s
+```
 
+Verify it:
+
+```bash
 kubectl config current-context
-kubectl get nodes
-
+kubectl get nodes -o wide
+```
 
 Expected context:
 
-Text
+```text
 kind-data-platform-lab
+```
 
-Terraform infrastructure
+Expected nodes:
 
-Terraform manages the spark and storage namespaces.
+```text
+data-platform-lab-control-plane
+data-platform-lab-worker
+data-platform-lab-worker2
+```
 
-Bash
-cd terraform
-terraform init
-terraform fmt
-terraform validate
-terraform plan
-terraform apply
+# Spark RBAC
+
+The Spark namespace contains a `spark` service account used by Spark driver pods.
+
+Apply RBAC:
+
+```bash
+kubectl apply \
+  -f kubernetes/spark/spark-rbac.yaml
+```
+
+Verify permissions:
+
+```bash
+kubectl auth can-i create pods \
+  --as=system:serviceaccount:spark:spark \
+  --namespace=spark
+
+kubectl auth can-i create services \
+  --as=system:serviceaccount:spark:spark \
+  --namespace=spark
+
+kubectl auth can-i create configmaps \
+  --as=system:serviceaccount:spark:spark \
+  --namespace=spark
+```
+
+Expected output:
+
+```text
+yes
+yes
+yes
+```
+
+# MinIO storage
+
+The `deploy-storage.yml` workflow creates and starts a MinIO-compatible S3 service using Docker Compose.
+
+## MinIO endpoints
+
+```text
+S3 API from the Mac:
+http://127.0.0.1:9000
+
+S3 API from Spark/kind:
+http://host.docker.internal:9000
+
+Administrative console from the Mac:
+http://127.0.0.1:9001
+```
+
+The MinIO S3 API must not be bound only to `127.0.0.1`, because Kubernetes pods need to reach the API through Docker Desktop's host gateway.
+
+Use:
+
+```yaml
+ports:
+  - "9000:9000"
+  - "127.0.0.1:9001:9001"
+```
+
+The administrative console remains restricted to the Mac.
+
+## MinIO image
+
+Do not use the unavailable Docker Hub images:
+
+```text
+minio/minio:latest
+minio/mc:latest
+```
+
+The current lab uses a pinned ARM64-capable MinIO image:
+
+```yaml
+image: alpine/minio:RELEASE.2025-10-15T17-29-55Z
+```
+
+The workflow uses the Amazon AWS CLI container for bucket administration:
+
+```text
+amazon/aws-cli:2.38.3
+```
+
+## Buckets
+
+The storage workflow creates these buckets idempotently:
+
+```text
+raw
+processed
+checkpoints
+spark-events
+```
+
+Suggested usage:
+
+```text
+raw
+  CSV, JSON, and original source datasets
+
+processed
+  Parquet and later Iceberg or Delta outputs
+
+checkpoints
+  Structured Streaming checkpoints
+
+spark-events
+  Spark event logs for a future Spark History Server
+```
+
+# Persistent MinIO data
+
+Do not store important MinIO data inside the GitHub Actions repository checkout.
+
+A self-hosted runner checkout can clean or replace repository directories. Use a Docker named volume instead.
+
+Recommended Compose configuration:
+
+```yaml
+services:
+  minio:
+    image: alpine/minio:RELEASE.2025-10-15T17-29-55Z
+    container_name: minio
+    hostname: minio
+
+    command:
+      - server
+      - /data
+      - --console-address
+      - ":9001"
+
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      TZ: Europe/Amsterdam
+
+    ports:
+      - "9000:9000"
+      - "127.0.0.1:9001:9001"
+
+    volumes:
+      - minio-data:/data
+
+    restart: unless-stopped
+
+volumes:
+  minio-data:
+    name: data-platform-minio-data
+```
+
+The named volume survives:
+
+- MinIO container recreation;
+- kind cluster deletion;
+- kind cluster recreation;
+- GitHub Actions repository checkout cleanup.
+
+Do not run the following command unless intentionally deleting all stored MinIO data:
+
+```bash
+docker compose down -v
+```
+
+The `-v` option deletes Compose-managed volumes.
+
+## Verify the MinIO volume
+
+```bash
+docker volume inspect \
+  data-platform-minio-data
+```
+
+Inspect the container mount:
+
+```bash
+docker inspect minio \
+  --format '{{range .Mounts}}{{println .Type .Name .Destination}}{{end}}'
+```
+
+Expected:
+
+```text
+volume data-platform-minio-data /data
+```
+
+## Verify MinIO health
+
+From the Mac:
+
+```bash
+curl -f \
+  http://127.0.0.1:9000/minio/health/ready
+```
+
+Check the container:
+
+```bash
+docker ps --filter name=minio
+docker logs --tail 100 minio
+docker port minio
+```
+
+Expected port mappings:
+
+```text
+9000/tcp -> 0.0.0.0:9000
+9001/tcp -> 127.0.0.1:9001
+```
+
+## Verify MinIO from Kubernetes
+
+Create a temporary connectivity pod:
+
+```bash
+kubectl run minio-connectivity-test \
+  --namespace spark \
+  --image=curlimages/curl:8.12.1 \
+  --restart=Never \
+  --command -- \
+  curl --fail --silent --show-error \
+    http://host.docker.internal:9000/minio/health/ready
+```
+
+Check the pod:
+
+```bash
+kubectl get pod \
+  -n spark \
+  minio-connectivity-test
+```
+
+Inspect its output:
+
+```bash
+kubectl logs \
+  -n spark \
+  minio-connectivity-test
+```
+
+Remove it:
+
+```bash
+kubectl delete pod \
+  -n spark \
+  minio-connectivity-test
+```
+
+# Verify MinIO buckets
+
+Set credentials in the current terminal without committing them:
+
+```bash
+export AWS_ACCESS_KEY_ID="<your MinIO username>"
+export AWS_SECRET_ACCESS_KEY="<your MinIO password>"
+export AWS_DEFAULT_REGION="us-east-1"
+```
+
+List buckets:
+
+```bash
+docker run --rm \
+  -e AWS_ACCESS_KEY_ID \
+  -e AWS_SECRET_ACCESS_KEY \
+  -e AWS_DEFAULT_REGION \
+  amazon/aws-cli:2.38.3 \
+  --endpoint-url http://host.docker.internal:9000 \
+  s3api list-buckets
+```
+
+Expected buckets:
+
+```text
+raw
+processed
+checkpoints
+spark-events
+```
+
+Test an object write:
+
+```bash
+echo "MinIO storage test" > /tmp/minio-test.txt
+```
+
+Upload it:
+
+```bash
+docker run --rm \
+  -v /tmp:/aws \
+  -e AWS_ACCESS_KEY_ID \
+  -e AWS_SECRET_ACCESS_KEY \
+  -e AWS_DEFAULT_REGION \
+  amazon/aws-cli:2.38.3 \
+  --endpoint-url http://host.docker.internal:9000 \
+  s3 cp \
+  /aws/minio-test.txt \
+  s3://raw/minio-test.txt
+```
+
+List the object:
+
+```bash
+docker run --rm \
+  -e AWS_ACCESS_KEY_ID \
+  -e AWS_SECRET_ACCESS_KEY \
+  -e AWS_DEFAULT_REGION \
+  amazon/aws-cli:2.38.3 \
+  --endpoint-url http://host.docker.internal:9000 \
+  s3 ls s3://raw/
+```
+
+# Spark image with S3A support
+
+Spark requires Hadoop's S3A connector to work with `s3a://` object-store paths.
+
+The required implementation is:
+
+```text
+org.apache.hadoop.fs.s3a.S3AFileSystem
+```
+
+The Hadoop module is:
+
+```text
+hadoop-aws
+```
+
+The `hadoop-aws` version must match the Hadoop version included in the Spark runtime.
+
+## Interactive versus cluster execution
+
+Both runtime sides need compatible S3A dependencies.
+
+```text
+Cluster-mode spark-submit:
+
+data-platform-spark image
+├── Spark driver pod
+└── Spark executor pods
 
 
-Do not commit Terraform state:
+Interactive Jupyter client mode:
 
-Gitignore
-**/.terraform/*
-*.tfstate
-*.tfstate.*
-*.tfplan
-crash.log
+JupyterLab image
+└── Spark driver
 
-Spark image
+data-platform-spark image
+└── Spark executor pods
+```
 
-The Spark image must include the timezone configuration and Hadoop S3A dependencies required to access MinIO through s3a:// paths.
+If only the executor image contains `hadoop-aws`, an interactive notebook can fail before tasks reach the executors:
 
-spark/Dockerfile:
+```text
+ClassNotFoundException:
+org.apache.hadoop.fs.s3a.S3AFileSystem
+```
 
-Dockerfile
-FROM spark:4.2.0-python3
+That happens because the Jupyter container hosts the Spark driver.
 
-USER root
+## Verify the Spark executor image
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV TZ=Europe/Amsterdam
-ENV JAVA_TOOL_OPTIONS="-Duser.timezone=Europe/Amsterdam"
+```bash
+docker run --rm \
+  data-platform-spark:latest \
+  sh -c '
+    ls -l /opt/spark/jars/hadoop-aws-*.jar
+  '
+```
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        tzdata \
-        ca-certificates \
-        curl \
-        maven && \
-    ln -snf /usr/share/zoneinfo/Europe/Amsterdam /etc/localtime && \
-    echo "Europe/Amsterdam" > /etc/timezone && \
-    dpkg-reconfigure -f noninteractive tzdata && \
-    rm -rf /var/lib/apt/lists/*
+Verify the*S3A class:
 
-# Detect the Hadoop version bundled with Spark and install the matching
-# Hadoop AWS/S3A connector and runtime dependencies.
-RUN set -eux; \
-    HADOOP_JAR="$(find /opt/spark/jars \
+```bash
+docker run --r* \
+  data-platform-spark:latest \
+  sh -c '
+    jar tf /opt/spark/jars/hadoop-aws-*.jar |
+    grep org/apache/hadoop/fs/s3a/S3AFileSystem.class
+  '
+```
+
+Expected:
+
+```text
+org/apache/hadoop/fs/s3a/S3AFileSystem.class
+```
+
+## Verify the Jupyter driver image
+
+The current Jupyter PySpark environment is expected under:
+
+```text
+/opt/conda/envs/spark310
+```
+
+Find the S3A connector:
+
+```bash
+docker exec jupyterlab \
+  sh -c '
+    find \
+      /opt/conda/envs/spark310/lib/python3.10/site-packages/pyspark/jars \
       -maxdepth 1 \
-      -type f \
-      -name 'hadoop-client-api-*.jar' \
-      | head -1)"; \
-    test -n "${HADOOP_JAR}"; \
-    HADOOP_VERSION="$(basename "${HADOOP_JAR}" \
-      | sed -E 's/^hadoop-client-api-(.+)\.jar$/\1/')"; \
-    echo "Detected Hadoop version: ${HADOOP_VERSION}"; \
-    mvn \
-      --batch-mode \
-      dependency:copy-dependencies \
-      -Dartifact="org.apache.hadoop:hadoop-aws:${HADOOP_VERSION}" \
-      -DincludeScope=runtime \
-      -DoutputDirectory=/tmp/s3a-jars; \
-    cp -v /tmp/s3a-jars/*.jar /opt/spark/jars/; \
-    test -f "/opt/spark/jars/hadoop-aws-${HADOOP_VERSION}.jar"; \
-    rm -rf /tmp/s3a-jars /root/.m2
+      -name "hadoop-aws-*.jar" \
+      -print
+  '
+```
 
-COPY jobs/ /opt/spark/jobs/
+Veri*y the class:
 
-USER 185
+```bash
+docker exec *upyterlab \
+  sh -c '
+    jar tf \*      /opt/conda/envs/spark310/lib*python3.10/site-packages/pyspark/j*rs/hadoop-aws-*.jar |
+    grep org/apache/hadoop/fs/s3a/S3AFileSystem.class
+  '
+```
 
+If the connector is missing, rebuild the JupyterLab image and restart the container and notebook kernel.
 
-Build and load the image into kind:
+# Connect JupyterLab to Spark on Kubernetes
 
-Bash
+Restart the Jupyter kernel before creating a new Spark application.
+
+Do not create a local Spark session such as:
+
+```python
+.master("local[3]")
+```
+
+Use the Kubernetes master:
+
+```python
+from pyspark.sql import SparkSession
+
+spark = (
+    SparkSession.builder
+    .master(
+        "k8s://https://data-platform-lab-control-plane:6443"
+    )
+    .appName("jupyter-minio-lab")
+
+    .config(
+        "spark.kubernetes.namespace",
+        "spark"
+    )
+    .config(
+        "spark.kubernetes.container.image",
+        "data-platform-spark:latest"
+    )
+    .config(
+        "spark.kubernetes.container.image.pullPolicy",
+        "Never"
+    )
+    .config(
+        "spark.kubernetes.authenticate.driver.serviceAccountName",
+        "spark"
+    )
+
+    .config(
+        "spark.executor.instances",
+        "2"
+    )
+    .config(
+        "spark.executor.cores",
+        "1"
+    )
+    .config(
+        "spark.executor.memory",
+        "2g"
+    )
+
+    .config(
+        "spark.driver.host",
+        "jupyterlab"
+    )
+    .config(
+        "spark.driver.port",
+        "7078"
+    )
+    .config(
+        "spark.driver.blockManager.port",
+        "7079"
+    )
+
+    .config(
+        "spark.hadoop.fs.s3a.endpoint",
+        "http://host.docker.internal:9000"
+    )
+    .config(
+        "spark.hadoop.fs.s3a.path.style.access",
+        "true"
+    )
+    .config(
+        "spark.hadoop.fs.s3a.connection.ssl.enabled",
+        "false"
+    )
+    .config(
+        "spark.hadoop.fs.s3a.impl",
+        "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    )
+    .config(
+        "spark.hadoop.fs.s3a.aws.credentials.provider",
+        "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
+    )
+
+    .config(
+        "spark.sql.session.timeZone",
+        "Europe/Amsterdam"
+    )
+
+    .config(
+        "spark.ui.enabled",
+        "true"
+    )
+    .config(
+        "spark.ui.port",
+        "4040"
+    )
+    .config(
+        "spark.ui.bindAddress",
+        "0.0.0.0"
+    )
+
+    .getOrCreate()
+)
+```
+
+Provide MinIO credentials through environment variables, a Kubernetes Secret, or protected runtime configuration.
+
+Do not commit literal credentials to the notebook or README.
+
+## Verify the Spark application
+
+```python
+print(
+    "Master:",
+    spark.sparkContext.master
+)
+
+print(
+    "Application:",
+    spark.sparkContext.applicationId
+)
+
+print(
+    "UI:",
+    spark.sparkContext.uiWebUrl
+)
+
+print(
+    "Timezone:",
+    spark.conf.get(
+        "spark.sql.session.timeZone"
+    )
+)
+```
+
+Expected master:
+
+```text
+k8s://https://data-platform-lab-control-plane:6443
+```
+
+## Verify S3A in the driver
+
+```python
+jvm = spark.sparkContext._jvm
+
+s3a_class = jvm.java.lang.Class.forName(
+    "org.apache.hadoop.fs.s3a.S3AFileSystem"
+)
+
+print(
+    s3a_class.getName()
+)
+```
+
+Expected:
+
+```text
+org.apache.hadoop.fs.s3a.S3AFileSystem
+```
+
+Verify Hadoop filesystem resolution:
+
+```python
+path = jvm.org.apache.hadoop.fs.Path(
+    "s3a://processed/orders"
+)
+
+filesystem = path.getFileSystem(
+    spark.sparkContext
+         ._jsc
+         .hadoopConfiguration()
+)
+
+print(
+    filesystem.getClass().getName()
+)
+```
+
+Expected:
+
+```text
+org.apache.hadoop.fs.s3a.S3AFileSystem
+```
+
+# Write Parquet to MinIO
+
+Generate synthetic data:
+
+```python
+from pyspark.sql import functions as F
+
+orders = (
+    spark.range(
+        1_000_000,
+        numPartitions=10
+    )
+    .withColumn(
+        "customer_id",
+        F.col("id") % 100_000
+    )
+    .withColumn(
+        "country",
+        F.when(
+            F.col("id") % 5 == 0,
+            "NL"
+        )
+        .when(
+            F.col("id") % 5 == 1,
+            "DE"
+        )
+        .when(
+            F.col("id") % 5 == 2,
+            "IT"
+        )
+        .when(
+            F.col("id") % 5 == 3,
+            "FR"
+        )
+        .otherwise("BE")
+    )
+    .withColumn(
+        "amount",
+        (
+            (F.col("id") % 1000) + 1
+        ).cast("double")
+    )
+)
+```
+
+Write partitioned Parquet:
+
+```python
+(
+    orders.write
+    .mode("overwrite")
+    .partitionBy("country")
+    .parquet(
+        "s3a://processed/orders"
+    )
+)
+```
+
+# Read Parquet from MinIO
+
+```python
+stored_orders = spark.read.parquet(
+    "s3a://processed/orders"
+)
+```
+
+Print the schema:
+
+```python
+stored_orders.printSchema()
+```
+
+Display rows:
+
+```python
+stored_orders.show(
+    20,
+    truncate=False
+)
+```
+
+This does not display rows:
+
+```python
+print(stored_orders)
+```
+
+It only prints the DataFrame representation.
+
+Use an action to retrieve or compute data:
+
+```python
+stored_orders.show()
+stored_orders.count()
+stored_orders.take(10)
+```
+
+Count the dataset:
+
+```python
+print(
+    "Rows:",
+    stored_orders.count()
+)
+```
+
+Expected count for the sample dataset:
+
+```text
+1000000
+```
+
+Display the country partitions:
+
+```python
+stored_orders \
+    .select("country") \
+    .distinct() \
+    .show()
+```
+
+Expected values:
+
+```text
+BE
+DE
+FR
+IT
+NL
+```
+
+# Partition pruning exercise
+
+```python
+nl_orders = (
+    stored_orders
+    .filter(
+        F.col("country") == "NL"
+    )
+    .select(
+        "customer_id",
+        "amount"
+    )
+)
+```
+
+Inspect the physical plan:
+
+```python
+nl_orders.explain(
+    "formatted"
+)
+```
+
+Execute:
+
+```python
+nl_orders.show(
+    20,
+    truncate=False
+)
+```
+
+Look for a partition filter based on `country`.
+
+# Verify Parquet objects with AWS CLI
+
+```bash
+docker run --rm \
+  -e AWS_ACCESS_KEY_ID \
+  -e AWS_SECRET_ACCESS_KEY \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  amazon/aws-cli:2.38.3 \
+  --endpoint-url http://host.docker.internal:9000 \
+  s3 ls \
+  s3://processed/orders/ \
+  --recursive
+```
+
+Expected keys include paths similar to:
+
+```text
+orders/country=NL/part-....snappy.parquet
+orders/country=DE/part-....snappy.parquet
+orders/country=IT/part-....snappy.parquet
+orders/country=FR/part-....snappy.parquet
+orders/country=BE/part-....snappy.parquet
+```
+
+# Timezones
+
+Different layers can display different timezone representations:
+
+```text
+Mac
+  Europe/Amsterdam
+
+kind node containers
+  UTC
+
+Kubernetes API timestamps
+  UTC with trailing Z
+
+Spark executor containers
+  Europe/Amsterdam when configured
+
+Spark SQL timestamps
+  Controlled by spark.sql.session.timeZone
+```
+
+These can represent the same instant.
+
+During Central European Summer Time:
+
+```text
+16:00 UTC = 18:00 CEST
+```
+
+A Kubernetes creation timestamp such as:
+
+```text
+2026-10-21T16:09:21Z
+```
+
+is intentionally returned in UTC.
+
+Changing the container timezone does not change Kubernetes API metadata timestamps.
+
+# Troubleshooting
+
+## `spark` is not defined
+
+A Jupyter kernel restart removes Python variables.
+
+Recreate the Kubernetes SparkSession before running:
+
+```python
+spark.createDataFrame(...)
+```
+
+## Spark reports `local[2]` or `local[3]`
+
+An existing local SparkContext was reused.
+
+Run:
+
+```python
+spark.stop()
+```
+
+Then restart the kernel and create the Kubernetes SparkSession as the first Spark operation.
+
+## Py4J `ConnectionRefusedError`
+
+The Java Spark process connected to the current notebook is no longer running.
+
+Restart the Jupyter kernel and create a fresh SparkSession.
+
+## Driver or Spark UI ports are busy
+
+Warnings such as these indicate an older process still owns the ports:
+
+```text
+sparkDriver could not bind on port 7078
+SparkUI could not bind on port 4040
+```
+
+Restart the notebook kernel or JupyterLab container.
+
+Use one SparkContext per notebook kernel.
+
+## Python version mismatch
+
+Python UDFs require compatible Python minor versions between driver and workers.
+
+Current target:
+
+```text
+Jupyter driver: Python 3.10
+Spark workers:  Python 3.10
+```
+
+## Arrow warning
+
+Spark 4.2 may attempt Arrow optimization for Python UDFs.
+
+Install compatible versions of:
+
+```text
+pandas
+pyarrow
+```
+
+in both the Jupyter driver image and Spark executor image if using Arrow-enabled Python UDFs.
+
+## Local file exists only in Jupyter
+
+A path such as:
+
+```text
+/home/jovyan/work/data/lookup.csv
+```
+
+exists only in the Jupyter container unless deliberately mounted into every executor.
+
+For distributed reads, use shared storage:
+
+```python
+spark.read.csv(
+    "s3a://raw/lookup.csv"
+)
+```
+
+For a tiny lookup, another option is to read it with Python on the driver and broadcast the resulting dictionary.
+
+## `ClassNotFoundException: S3AFileSystem`
+
+Error:
+
+```text
+Class org.apache.hadoop.fs.s3a.S3AFileSystem not found
+```
+
+The process hosting the Spark driver is missing `hadoop-aws` and its compatible AWS SDK dependencies.
+
+In Jupyter client mode, install S3A dependencies in both:
+
+```text
+JupyterLab image
+data-platform-spark image
+```
+
+Rebuild JupyterLab and restart the notebook kernel.
+
+## S3A connector missing from the Spark image
+
+Verify:
+
+```bash
+docker run --rm \
+  data-platform-spark:latest \
+  sh -c '
+    ls -l /opt/spark/jars/hadoop-aws-*.jar
+  '
+```
+
+If missing, update `spark/Dockerfile`, rebuild without cache, and load the image into kind again.
+
+```bash
 docker build \
   --no-cache \
+  --progress=plain \
   --platform linux/arm64 \
   -t data-platform-spark:latest \
   ./spark
@@ -243,710 +1193,193 @@ docker build \
 kind load docker-image \
   data-platform-spark:latest \
   --name data-platform-lab
+```
 
+Existing Spark pods continue using the old image. Stop the existing application and create new pods.
 
-Verify S3A support:
+## MinIO returns `listPathRaw: 0 drives provided`
 
-Bash
-docker run --rm \
-  data-platform-spark:latest \
-  sh -c 'ls -l /opt/spark/jars/hadoop-aws-*.jar'
+MinIO does not have a usable storage backend mounted at `/data`.
 
-Spark RBAC
+Check:
 
-kubernetes/spark/spark-rbac.yaml should grant the Spark service account permission to manage Spark resources:
-
-Yaml
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: spark
-  namespace: spark
-
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: spark-role
-  namespace: spark
-rules:
-  - apiGroups: [""]
-    resources:
-      - pods
-      - services
-      - configmaps
-      - persistentvolumeclaims
-    verbs:
-      - create
-      - get
-      - list
-      - watch
-      - delete
-      - deletecollection
-      - patch
-      - update
-
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: spark-role-binding
-  namespace: spark
-subjects:
-  - kind: ServiceAccount
-    name: spark
-    namespace: spark
-roleRef:
-  kind: Role
-  name: spark-role
-  apiGroup: rbac.authorization.k8s.io
-
-
-Apply it:
-
-Bash
-kubectl apply -f kubernetes/spark/spark-rbac.yaml
-
-MinIO storage
-
-MinIO runs as a Docker container outside kind. This keeps object storage separate from the disposable Kubernetes compute cluster.
-
-The storage workflow creates these buckets:
-
-Text
-raw
-processed
-checkpoints
-spark-events
-
-
-Endpoints:
-
-Text
-Mac S3 API:         http://127.0.0.1:9000
-Spark/kind S3 API:  http://host.docker.internal:9000
-Mac console:        http://127.0.0.1:9001
-
-
-The S3 API port must be reachable from kind pods:
-
-Yaml
-ports:
-  - "9000:9000"
-  - "127.0.0.1:9001:9001"
-
-
-Use a Docker named volume for persistent storage:
-
-Yaml
-services:
-  minio:
-    volumes:
-      - minio-data:/data
-
-volumes:
-  minio-data:
-    name: data-platform-minio-data
-
-
-Do not use docker compose down -v unless the intention is to delete all stored data.
-
-Verify MinIO:
-
-Bash
-curl -f http://127.0.0.1:9000/minio/health/ready
-
-docker volume inspect data-platform-minio-data
+```bash
+docker logs --tail 200 minio
 
 docker inspect minio \
-  --format '{{range .Mounts}}{{println .Type .Name .Destination}}{{end}}'
+  --format '{{json .Mounts}}' |
+  python3 -m json.tool
 
-
-Expected mount:
-
-Text
-volume data-platform-minio-data /data
-
-JupyterLab image
-
-Create the JupyterLab image with Java, Python 3.10, PySpark 4.2.0, and the same Hadoop S3A dependencies used by Spark executors.
-
-The Jupyter image also needs S3A because Jupyter hosts the Spark driver in client mode. If only the executor image has S3A, writing s3a://... fails in the driver with ClassNotFoundException: org.apache.hadoop.fs.s3a.S3AFileSystem.
-
-Dockerfile:
-
-Dockerfile
-FROM quay.io/jupyter/base-notebook:latest
-
-USER root
-
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        openjdk-21-jdk-headless \
-        tzdata \
-        ca-certificates \
-        maven && \
-    rm -rf /var/lib/apt/lists/*
-
-USER ${NB_UID}
-
-RUN mamba create -y \
-        -n spark310 \
-        python=3.10 \
-        pip \
-        ipykernel \
-        pandas \
-        pyarrow && \
-    mamba clean --all -f -y
-
-RUN /opt/conda/envs/spark310/bin/python \
-    -m pip install --no-cache-dir \
-    "pyspark[sql]==4.2.0"
-
-RUN /opt/conda/envs/spark310/bin/python \
-    -m ipykernel install \
-    --user \
-    --name spark310 \
-    --display-name "PySpark 4.2 - Python 3.10"
-
-USER root
-
-RUN set -eux; \
-    PYSPARK_JARS="/opt/conda/envs/spark310/lib/python3.10/site-packages/pyspark/jars"; \
-    HADOOP_JAR="$(find "${PYSPARK_JARS}" \
-      -maxdepth 1 \
-      -name 'hadoop-client-api-*.jar' \
-      | head -1)"; \
-    test -n "${HADOOP_JAR}"; \
-    HADOOP_VERSION="$(basename "${HADOOP_JAR}" \
-      | sed -E 's/^hadoop-client-api-(.+)\.jar$/\1/')"; \
-    mvn \
-      --batch-mode \
-      dependency:copy-dependencies \
-      -Dartifact="org.apache.hadoop:hadoop-aws:${HADOOP_VERSION}" \
-      -DincludeScope=runtime \
-      -DoutputDirectory=/tmp/s3a-jars; \
-    cp -v /tmp/s3a-jars/*.jar "${PYSPARK_JARS}/"; \
-    test -f "${PYSPARK_JARS}/hadoop-aws-${HADOOP_VERSION}.jar"; \
-    rm -rf /tmp/s3a-jars /root/.m2
-
-USER ${NB_UID}
-
-
-docker-compose.yml:
-
-Yaml
-services:
-  jupyterlab:
-    build:
-      context: .
-      dockerfile: Dockerfile
-
-    container_name: jupyterlab
-    hostname: jupyterlab
-
-    ports:
-      - "8888:8888"
-      - "127.0.0.1:4040:4040"
-
-    volumes:
-      - ./notebooks:/home/jovyan/work
-      - /Users/vx53cd/.kube:/home/jovyan/.kube:ro
-
-    environment:
-      - JUPYTER_ENABLE_LAB=yes
-      - KUBECONFIG=/home/jovyan/.kube/config
-      - TZ=Europe/Amsterdam
-
-    restart: unless-stopped
-
-    command: start-notebook.sh --NotebookApp.token=''
-
-
-Build and start JupyterLab:
-
-Bash
-docker compose down
-docker compose build --no-cache
-docker compose up -d
-
-
-Verify S3A in Jupyter:
-
-Bash
-docker exec jupyterlab \
+docker exec minio \
   sh -c '
-    find /opt/conda/envs/spark310/lib/python3.10/site-packages/pyspark/jars \
-      -maxdepth 1 \
-      -name "hadoop-aws-*.jar" \
-      -print
+    id
+    ls -ld /data
+    ls -la /data
+    df -h /data
   '
+```
 
-HOW TO: Connect JupyterLab to the Spark cluster
+Use a Docker nam*d volume:
 
-This procedure uses JupyterLab as the Spark driver while Kubernetes runs the Spark executor pods.
-
-1. Confirm that kind is running
-Bash
-kubectl config current-context
-kubectl get nodes
-kubectl get namespace spark
-
-
-The context should be:
-
-Text
-kind-data-platform-lab
-
-
-All three nodes should be Ready.
-
-2. Export the kind CA certificate
-
-Java must trust the certificate presented by the kind Kubernetes API server.
-
-Run on the Mac:
-
-Bash
-kubectl config view \
-  --raw \
-  --minify \
-  --flatten \
-  -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' \
-  | base64 --decode \
-  > /Users/vx53cd/.kube/kind-data-platform-lab-ca.crt
-
-
-Verify it:
-
-Bash
-head -1 /Users/vx53cd/.kube/kind-data-platform-lab-ca.crt
-
-
-Expected output:
-
-Text
------BEGIN CERTIFICATE-----
-
-3. Recreate JupyterLab with the kubeconfig mount
-
-The Compose configuration must include:
-
-Yaml
+```yaml
 volumes:
-  - ./notebooks:/home/jovyan/work
-  - /Users/vx53cd/.kube:/home/jovyan/.kube:ro
+  - mi*io-data:/data
 
+volumes:
+  minio-da*a:
+    name: data-platform-minio-d*ta
+```
 
-Recreate the container:
+Then recreate the MinIO co*tainer without deleting the volume*
 
-Bash
-docker compose down
-docker compose up -d --build
+## Workflow still pulls `minio/m*nio:latest`
 
-4. Connect JupyterLab to the kind network
-Bash
-docker network connect kind jupyterlab
+The workflow run is u*ing an old commit or old branch.
 
+*erify the remote workflow:
 
-If Docker says the endpoint already exists, the container is already connected.
+```bas*
+git fetch origin
 
-Verify the connection:
+git show \
+  or*gin/main:.github/workflows/deploy-*torage.yml |
+  grep -nE \
+    'ima*e:|force-recreate|*000:9000'
+```
 
-Bash
-docker inspect jupyterlab \
-  --format '{{json .NetworkSettings.Networks}}'
+Start a new run fro* the updated `main` branch.
 
-5. Verify the mounted Kubernetes files
-Bash
-docker inspect jupyterlab \
-  --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}'
+Do no* rerun an old historical workflow*run if the old run points to an ol*er commit.
 
+## Kubernetes nodes*show UTC
+
+*his is normal:
+
+```bash
+docker exe* \
+  data-platform-lab-control-pla*e \
+  date
+```
+
+kind nodes use the*`kindest/node`*image and can remain*on UTC.
+
+Your Spark Dockerfile onl* changes*Spark containers, not kind node co*tainers.
+
+## Kubernetes*creation timestamps show UTC*
+This command always returns Kuber*etes API metadata in UTC:
+
+```bash*kubectl get pod \
+  -n spark \
+  -* jsonpath='{.items[0].metadata.cre*tionTimestamp}{"\n"}'
+```
+
+A trail*ng `Z` means UTC.
+
+# Useful comman*s
+
+## Kubernetes
+
+```bash
+kubectl *onfig current-context
+
+kubectl get*nodes -o wide
+
+kubectl*get namespaces
+
+kubectl get pods -* spark -o wide
+
+kubectl get pods -*
+```
+
+## Spark image*
+```bash
+docker run --rm \
+  data-*latform-spark:latest \
+  sh -c '
+ *  ls -l /opt/spark/jars/hadoop-aws**.jar
+  '
+```
+
+## Jupyter versions*
+```bash
 docker exec jupyterlab \
-  ls -l /home/jovyan/.kube/config
+* /opt/conda/envs/spark310/bin/pyth*n \
+  -c '
+*mport sys
+import pyspark
 
-docker exec jupyterlab \
-  ls -l /home/jovyan/.kube/kind-data-platform-lab-ca.crt
+*rint(sys.version)
+print(pyspark.__*ersion*_)
+'
+```
 
+## MinIO
 
-Verify Java and PySpark using the Python 3.10 environment:
+```bash
+docker*ps --filter name=minio*
+docker logs --tail 100 minio
 
-Bash
-docker exec jupyterlab java -version
+doc*er port minio
 
-docker exec jupyterlab \
-  /opt/conda/envs/spark310/bin/python \
-  -c "import sys, pyspark; print(sys.version); print(pyspark.__version__)"
+docker volume inspe*t \
+  data-platform-minio-data
 
+cu*l -f \
+  http://127.0.0.1:9000/min*o/health/ready
+```
 
-Expected versions:
+## Spark UI
 
-Text
-Python 3.10
-PySpark 4.2.0
+O*en:
 
-6. Open JupyterLab
+```text
+http://127.0.0.1:4040*```
+
+Useful tabs:
+
+```text
+Jobs
+St*ges
+Storage
+Executors
+SQL
+Environm*nt
+```
+
+## MinIO console
 
 Open:
 
-Text
-http://127.0.0.1:8888
-
-
-Select the kernel:
-
-Text
-PySpark 4.2 - Python 3.10
-
-
-Restart the notebook kernel before creating the Kubernetes Spark session. This prevents reuse of an older local[2] SparkContext.
-
-7. Create the Kubernetes Spark session
-
-Run this as the first Spark cell. Supply the MinIO credentials through protected environment variables or another secure mechanism. Do not commit literal credentials in the notebook.
-
-Python
-import os
-from pathlib import Path
-from pyspark.sql import SparkSession
-
-ca_file = "/home/jovyan/.kube/kind-data-platform-lab-ca.crt"
-assert Path(ca_file).exists(), f"CA certificate not found: {ca_file}"
-
-minio_user = os.environ["AWS_ACCESS_KEY_ID"]
-minio_password = os.environ["AWS_SECRET_ACCESS_KEY"]
-
-spark = (
-    SparkSession.builder
-    .master("k8s://https://data-platform-lab-control-plane:6443")
-    .appName("jupyter-k8s-test")
-
-    .config("spark.kubernetes.namespace", "spark")
-    .config("spark.kubernetes.container.image", "data-platform-spark:latest")
-    .config("spark.kubernetes.container.image.pullPolicy", "Never")
-    .config("spark.kubernetes.authenticate.caCertFile", ca_file)
-    .config(
-        "spark.kubernetes.authenticate.driver.serviceAccountName",
-        "spark",
-    )
-
-    .config("spark.executor.instances", "2")
-    .config("spark.executor.cores", "1")
-    .config("spark.executor.memory", "2g")
-
-    .config("spark.driver.host", "jupyterlab")
-    .config("spark.driver.port", "7078")
-    .config("spark.driver.blockManager.port", "7079")
-
-    .config(
-        "spark.hadoop.fs.s3a.endpoint",
-        "http://host.docker.internal:9000",
-    )
-    .config("spark.hadoop.fs.s3a.path.style.access", "true")
-    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
-    .config(
-        "spark.hadoop.fs.s3a.impl",
-        "org.apache.hadoop.fs.s3a.S3AFileSystem",
-    )
-    .config(
-        "spark.hadoop.fs.s3a.aws.credentials.provider",
-        "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
-    )
-    .config("spark.hadoop.fs.s3a.access.key", minio_user)
-    .config("spark.hadoop.fs.s3a.secret.key", minio_password)
-
-    .config("spark.sql.session.timeZone", "Europe/Amsterdam")
-
-    .config("spark.ui.enabled", "true")
-    .config("spark.ui.port", "4040")
-    .config("spark.ui.bindAddress", "0.0.0.0")
-
-    .getOrCreate()
-)
-
-8. Verify Kubernetes execution and S3A
-Python
-print("Master:", spark.sparkContext.master)
-print("Application ID:", spark.sparkContext.applicationId)
-print("Spark UI:", spark.sparkContext.uiWebUrl)
-print("Timezone:", spark.conf.get("spark.sql.session.timeZone"))
-
-
-The master must be:
-
-Text
-k8s://https://data-platform-lab-control-plane:6443
-
-
-Verify that the driver can load S3A:
-
-Python
-jvm = spark.sparkContext._jvm
-
-print(
-    jvm.java.lang.Class.forName(
-        "org.apache.hadoop.fs.s3a.S3AFileSystem"
-    ).getName()
-)
-
-
-Expected:
-
-Text
-org.apache.hadoop.fs.s3a.S3AFileSystem
-
-9. Run the test job
-Python
-from pyspark.sql.functions import expr
-
-df = (
-    spark.range(1, 1_000_000)
-    .toDF("id")
-    .repartition(10)
-    .withColumn("square", expr("id * id"))
-    .cache()
-)
-
-df.take(10)
-
-
-Verify the number of partitions:
-
-Python
-df.rdd.getNumPartitions()
-
-
-Expected result:
-
-Text
-10
-
-
-Materialize the complete cache:
-
-Python
-df.count()
-
-10. Write Parquet to MinIO
-
-Create sample orders:
-
-Python
-from pyspark.sql import functions as F
-
-orders = (
-    spark.range(1_000_000, numPartitions=10)
-    .withColumn("customer_id", F.col("id") % 100_000)
-    .withColumn(
-        "country",
-        F.when(F.col("id") % 5 == 0, "NL")
-         .when(F.col("id") % 5 == 1, "DE")
-         .when(F.col("id") % 5 == 2, "IT")
-         .when(F.col("id") % 5 == 3, "FR")
-         .otherwise("BE"),
-    )
-    .withColumn(
-        "amount",
-        ((F.col("id") % 1000) + 1).cast("double"),
-    )
-)
-
-
-Write partitioned Parquet:
-
-Python
-(
-    orders.write
-    .mode("overwrite")
-    .partitionBy("country")
-    .parquet("s3a://processed/orders")
-)
-
-11. Read Parquet from MinIO
-Python
-stored_orders = spark.read.parquet(
-    "s3a://processed/orders"
-)
-
-stored_orders.printSchema()
-stored_orders.show(20, truncate=False)
-print("Rows:", stored_orders.count())
-
-
-print(stored_orders) does not display DataFrame rows. Use show(), count(), or another action.
-
-Verify the partition column:
-
-Python
-stored_orders.select("country").distinct().show()
-
-
-Test partition pruning:
-
-Python
-nl_orders = (
-    stored_orders
-    .filter(F.col("country") == "NL")
-    .select("customer_id", "amount")
-)
-
-nl_orders.explain("formatted")
-nl_orders.show(20, truncate=False)
-
-12. Check Kubernetes executor pods
-
-Run from the Mac while the notebook Spark session is active:
-
-Bash
-kubectl get pods -n spark -o wide
-
-
-For a live view:
-
-Bash
-kubectl get pods -n spark -w
-
-
-In Jupyter client mode, JupyterLab hosts the driver and Kubernetes creates the executor pods.
-
-13. Open the Spark UI and MinIO console
-
-Spark UI:
-
-Text
-http://127.0.0.1:4040
-
-
-MinIO console:
-
-Text
-http://127.0.0.1:9001
-
-
-Useful Spark UI tabs:
-
-Jobs: actions triggered by take(), count(), reads, and writes
-Stages: shuffles introduced by repartitioning and aggregation
-Executors: Kubernetes executor pods
-Storage: cached DataFrames
-SQL: DataFrame execution plans
-14. Stop the Spark session
-Python
-spark.stop()
-
-
-Then verify executor cleanup:
-
-Bash
-kubectl get pods -n spark
-
-Troubleshooting
-The notebook reports local[2]
-
-An existing local SparkContext was reused. Stop Spark, restart the kernel, and create the Kubernetes session as the first Spark operation.
-
-PKIX path building failed
-
-Confirm that the CA file exists inside JupyterLab:
-
-Bash
-docker exec jupyterlab \
-  ls -l /home/jovyan/.kube/kind-data-platform-lab-ca.crt
-
-
-Confirm the Spark builder contains:
-
-Python
-.config(
-    "spark.kubernetes.authenticate.caCertFile",
-    "/home/jovyan/.kube/kind-data-platform-lab-ca.crt",
-)
-
-Executor pods cannot connect to the driver
-
-Confirm that JupyterLab belongs to the kind Docker network:
-
-Bash
-docker network connect kind jupyterlab
-
-
-Retain these driver settings:
-
-Python
-.config("spark.driver.host", "jupyterlab")
-.config("spark.driver.port", "7078")
-.config("spark.driver.blockManager.port", "7079")
-
-Python version mismatch
-
-The Python minor version must match between the Jupyter driver and Spark workers. Use the PySpark 4.2 - Python 3.10 kernel and verify Spark executors also use Python 3.10.
-
-ClassNotFoundException: org.apache.hadoop.fs.s3a.S3AFileSystem
-
-The process hosting the Spark driver is missing hadoop-aws and its compatible runtime dependencies.
-
-In Jupyter client mode, install matching S3A dependencies in both:
-
-Text
-Jupyter image
-Spark executor image
-
-
-Then rebuild JupyterLab, restart the kernel, rebuild the Spark image, and reload it into kind.
-
-listPathRaw: 0 drives provided
-
-MinIO does not have a usable /data storage mount. Use and verify the Docker named volume:
-
-Bash
-docker volume inspect data-platform-minio-data
-
-docker inspect minio \
-  --format '{{range .Mounts}}{{println .Type .Name .Destination}}{{end}}'
-
-
-Expected:
-
-Text
-volume data-platform-minio-data /data
-
-MinIO pulls minio/minio:latest
-
-The old workflow is running. Verify the current remote workflow and start a new workflow run from main rather than rerunning an old failed run:
-
-Bash
-git fetch origin
-
-git show origin/main:.github/workflows/deploy-storage.yml \
-  | grep -nE 'image:|force-recreate|9000:9000'
-
-Spark UI is unavailable
-
-Confirm that Compose publishes port 4040, recreate JupyterLab, reconnect it to kind, restart the notebook kernel, and recreate the Spark session.
-
-Useful commands
-Bash
-kubectl get nodes
-kubectl get pods -A
-kubectl get pods -n spark -o wide
-kubectl get serviceaccount,role,rolebinding -n spark
-
-docker network inspect kind
-docker port jupyterlab
-docker exec jupyterlab java -version
-docker exec jupyterlab \
-  /opt/conda/envs/spark310/bin/python \
-  -c "import sys, pyspark; print(sys.version); print(pyspark.__version__)"
-
-docker ps --filter name=minio
-docker logs --tail 100 minio
-docker port minio
-docker volume inspect data-platform-minio-data
-
-Suggested next steps
-Add Spark event logging to s3a://spark-events/.
-Add a Spark History Server.
-Use s3a://checkpoints/ for Structured Streaming checkpoints.
-Add Delta Lake or Apache Iceberg after Parquet reads and writes are stable.
-Create exercises for joins, partitioning, shuffles, caching, and data skew.
-Add automated tests for PySpark transformations. EOF python - <<'PY' from pathlib import Path p=Path('/mnt/data/README.md') s=p.read_text() checks=[ '# Data Platform Lab', '# HOW TO: Connect JupyterLab to the Spark cluster', '## MinIO storage', 's3a://processed/orders', 'data-platform-minio-data', 'ClassNotFoundException: org.apache.hadoop.fs.s3a.S3AFileSystem', '- Add Spark event logging to s3a://spark-events/.', ] for c in checks: assert c in s, c print(f'{p.name}: {len(s.splitlines())} lines, {p.stat().st_size} bytes') PY
+`*`text
+http://127.0.0.1:9001*```
+
+# Next steps
+
+1. Move S3A cre*entials completely out of Spark co*mand-line configuration.
+2. Inject*standard AWS environment variables*into Spark driver and executor pod*:
+   - `AWS_ACCESS_KEY_ID`
+   - `A*S_SECRET_ACCESS_KEY`
+3. Add Spark *vent logging to:
+
+```text
+s3a://sp*rk-events/
+```
+
+4. Deploy a Spark *istory Server.
+5. Store Structured*Streaming checkpoints under:
+
+```t*xt
+s3a://checkpoints/
+```
+
+6. Add * raw CSV-to-partitioned-Parquet pi*eline:
+
+```text
+s3a://raw*
+    ↓
+Spark transformations
+    ↓*s3a://processed/
+```
+
+7. Add Apach* Iceberg or Delta Lake after basic*Parquet operations are stable.
+```**
