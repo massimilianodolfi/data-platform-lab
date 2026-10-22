@@ -62,6 +62,9 @@ jobs:
               container_name: minio
               hostname: minio
 
+              # Home-lab workaround: allow MinIO to initialize the Docker volume.
+              user: "0:0"
+
               command:
                 - server
                 - /data
